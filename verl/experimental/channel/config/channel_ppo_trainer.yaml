@@ -1,0 +1,12 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# config for Channel
+channel:
+  enable: True
+  num_nodes: 1
