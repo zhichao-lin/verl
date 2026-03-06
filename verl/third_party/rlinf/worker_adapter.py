@@ -61,10 +61,17 @@ def create_rlinf_worker(group_name: str, rank: int, world_size: int):
         node_group_label = node_group.label
 
         # Worker context
-        from verl.utils.ray_utils import ray_noset_visible_devices
+        # RAY_NOSET | isolate_accelerator | visible_devices | local_hardware_ranks | local_accelerator_rank | node_local_rank | node_local_world_size
+        #     -     |       True          |      [2]        |         "2"          |          2             |       0         |          1
+        #     1     |       True          |   [0,1,2,3]     |      "0,1,2,3"       |          2             |       2         |          1
+        # AgentLoopWorker context
+        #     -     |       True          |       []        |         ""           |         -1             |       0         |          1
+        #     1     |       True          |   [0,1,2,3]     |      "0,1,2,3"       |          0             |       0         |          1
+        #     1     |       True          |   [4,5,6,7]     |      "4,5,6,7"       |          4             |       0         |          1
+        # AgentLoopWorker context - manually set CUDA_VISIBLE_DEVICES
+        #     1     |       True         |       [2]        |         "2"          |          2             |       0         |          1
         from verl.utils.device import is_npu_available
 
-        isolate_accelerator = False if ray_noset_visible_devices() else True
         visible_devices = AcceleratorUtil.get_visible_devices(accelerator_type)
         local_hardware_ranks = ",".join(map(str, visible_devices))
 
@@ -96,7 +103,7 @@ def create_rlinf_worker(group_name: str, rank: int, world_size: int):
             node_local_rank=node_local_rank,
             node_local_world_size=node_local_world_size,
             local_hardware_ranks=local_hardware_ranks,
-            isolate_accelerator=isolate_accelerator,
+            isolate_accelerator=True,
             catch_system_failure=False,
         )
     return _RLINF_WORKER

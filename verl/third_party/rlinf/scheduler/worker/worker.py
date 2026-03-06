@@ -578,7 +578,7 @@ class Worker(metaclass=WorkerMeta):
         world_size: int,
         cluster_node_rank: int = 0,
         node_group_label: Optional[str] = None,
-        accelerator_type: Optional[AcceleratorType] = None,
+        accelerator_type: Optional[str] = None,
         accelerator_model: str = "",
         local_accelerator_rank: int = -1,
         node_local_rank: int = 0,
@@ -598,11 +598,8 @@ class Worker(metaclass=WorkerMeta):
         (so that the global managers such as WorkerManager and CollectiveManager
         are running in the same Ray namespace).
         """
-        # Ensure we are in the same namespace as the running Cluster / managers.
-        # Cluster() here will either attach to an existing cluster or create a
-        # lightweight view of it in this process.
-        cluster = Cluster()
         if node_group_label is None:
+            cluster = Cluster()
             node_group = cluster.get_node_group()
             assert (
                 node_group is not None
@@ -610,22 +607,21 @@ class Worker(metaclass=WorkerMeta):
             node_group_label = node_group.label
 
         if accelerator_type is None:
-            accelerator_type = AcceleratorType.NO_ACCEL
+            accelerator_type = AcceleratorType.NO_ACCEL.value
 
         worker_address = WorkerAddress(group_name, rank)
 
         # Namespace must be set before Worker.__init__ is executed.
         os.environ["CLUSTER_NAMESPACE"] = Cluster.NAMESPACE
 
-        # Only set core distributed envs if they are not already configured
-        # by the outer Ray actor. This allows users to preconfigure
-        # WORLD_SIZE / RANK / LOCAL_WORLD_SIZE / LOCAL_RANK, etc.
+        # Only set core distributed envs if they are not already configured.
         env_defaults: dict[str, str] = {
+            "GROUP_NAME": group_name,
             "WORKER_NAME": worker_address.get_name(),
             "WORLD_SIZE": str(world_size),
             "RANK": str(rank),
             "CLUSTER_NODE_RANK": str(cluster_node_rank),
-            "ACCELERATOR_TYPE": str(accelerator_type.value),
+            "ACCELERATOR_TYPE": str(accelerator_type),
             "ACCELERATOR_MODEL": accelerator_model,
             "LOCAL_ACCELERATOR_RANK": str(local_accelerator_rank),
             "NODE_LOCAL_RANK": str(node_local_rank),
@@ -635,12 +631,11 @@ class Worker(metaclass=WorkerMeta):
             "ISOLATE_ACCELERATOR": (
                 ("1" if isolate_accelerator else "0")
                 if isolate_accelerator is not None
-                else os.environ.get("ISOLATE_ACCELERATOR", "0")
+                else os.environ.get("ISOLATE_ACCELERATOR", "1")
             ),
         }
 
-        # These variables should not be overridden if the user has already
-        # configured them before creating the RLinf Worker.
+        # These variables should not be overridden if already configured.
         user_controlled_keys = {
             "WORLD_SIZE",
             "RANK",
@@ -658,7 +653,6 @@ class Worker(metaclass=WorkerMeta):
         if catch_system_failure is not None:
             os.environ["CATCH_SYSTEM_FAILURE"] = "1" if catch_system_failure else "0"
 
-        # Now we can safely construct the Worker instance in this Ray actor.
         return cls()
 
     def send(
@@ -1181,14 +1175,18 @@ class Worker(metaclass=WorkerMeta):
                     )
             self._master_address = worker_info.node_ip
             self._master_port = worker_info.node_port
-            if "MASTER_ADDR" not in os.environ and "MASTER_PORT" not in os.environ:
+
+            if "MASTER_ADDR" not in os.environ:
                 os.environ["MASTER_ADDR"] = self._master_address
-                os.environ["MASTER_PORT"] = str(self._master_port)
             else:
                 if os.environ["MASTER_ADDR"] != self._master_address:
                     raise ValueError(
                         f"MASTER_ADDR is already set to {os.environ['MASTER_ADDR']}, conflicting with {self._master_address}"
                     )
+
+            if "MASTER_PORT" not in os.environ:
+                os.environ["MASTER_PORT"] = str(self._master_port)
+            else:
                 if os.environ["MASTER_PORT"] != str(self._master_port):
                     raise ValueError(
                         f"MASTER_PORT is already set to {os.environ['MASTER_PORT']}, conflicting with {self._master_port}"
@@ -1367,6 +1365,9 @@ class Worker(metaclass=WorkerMeta):
                         f"MASTER_ADDR is already set to {env_master_addr}, conflicting with {node_ip}"
                     )
                 node_port = int(env_master_port)
+                success = self._port_lock.acquire(node_port)
+                if not success:
+                    raise RuntimeError(f"MASTER_PORT {node_port} is unavailable")
             else:
                 node_port = self.acquire_free_port()
         else:

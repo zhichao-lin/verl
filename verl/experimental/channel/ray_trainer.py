@@ -320,11 +320,11 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-        self.tq_client = self._initialize_transferqueue()
+        self.tq_client = self._initialize_channel()
 
         self.checkpoint_manager = None
 
-    def _initialize_transferqueue(self):
+    def _initialize_channel(self):
         # 1. initialize TransferQueueStorage
         if self.config.transfer_queue.storage_backend == "AsyncSimpleStorageManager":
             train_data_size = (

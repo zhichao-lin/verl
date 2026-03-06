@@ -1372,6 +1372,44 @@ class CollectiveGroup:
             peer_tensor_devices_tensor, peer_tensor_devices_tensor_size
         )
 
+        # If all peer tensor device UUIDs are identical and that device is available on this
+        # worker, switch current_device to enable IPC instead of falling back to NCCL.
+        #
+        # This is especially useful when the two workers have overlapping accelerators
+        # but each worker has multiple visible devices, making the mapping uncertain.
+        if (
+            isinstance(peer_tensor_devices, list)
+            and len(peer_tensor_devices) > 0
+            and len(set(peer_tensor_devices)) == 1
+            and Worker.torch_platform is not None
+        ):
+            peer_device_uuid = peer_tensor_devices[0]
+            device_count = (
+                Worker.torch_platform.device_count()
+                if hasattr(Worker.torch_platform, "device_count")
+                else 0
+            )
+            target_dev_idx = None
+            for dev_idx in range(device_count):
+                try:
+                    uuid = str(Worker.torch_platform.get_device_properties(dev_idx).uuid)
+                except Exception:
+                    continue
+                if uuid == peer_device_uuid:
+                    target_dev_idx = dev_idx
+                    break
+
+            if (
+                target_dev_idx is not None
+                and hasattr(Worker.torch_platform, "set_device")
+                and Worker.torch_platform.current_device() != target_dev_idx
+            ):
+                self._logger.debug(
+                    f"Switching current device from {Worker.torch_platform.current_device()} to {target_dev_idx} "
+                    f"to match peer device UUID {peer_device_uuid} for IPC recv"
+                )
+                Worker.torch_platform.set_device(target_dev_idx)
+
         current_device = str(
             Worker.torch_platform.get_device_properties(
                 Worker.torch_platform.current_device()
