@@ -140,6 +140,30 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def broadcast_with_rlinf(
+    obj,
+    group_ranks: list[int],
+    stage_name: str,
+):
+    """Broadcast an object within the current SP group through RLinf worker collective."""
+    from verl.third_party.rlinf.scheduler.worker.worker import Worker as RLinfWorker
+
+    rlinf_worker = RLinfWorker.current_worker
+    if rlinf_worker is None:
+        raise RuntimeError(f"{stage_name}: RLinf worker context is not initialized.")
+
+    group_name = rlinf_worker.group_name
+    out = rlinf_worker.broadcast(
+        object=obj,
+        groups=[(group_name, group_ranks)],
+        src=None,
+        async_op=False,
+    )
+    if out is None:
+        raise RuntimeError(f"{stage_name}: broadcast returned None.")
+    return out
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -1169,6 +1193,92 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def channel_train_prepare_from_reward(
+        self,
+        reward_ch,
+        output_ch,
+        train_flags: dict,
+    ):
+        from verl.trainer.ppo.ray_trainer import compute_response_mask
+
+        dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("actor", self.rank))
+        is_collect = bool(self.query_collect_info("actor"))
+        sp_group = self.ulysses_device_mesh["sp"].get_group() if self.ulysses_device_mesh is not None else None
+        if is_collect:
+            batch = reward_ch.get(key=dp_rank, async_op=False)
+        else:
+            batch = None
+        if sp_group is not None:
+            group_ranks = dist.get_process_group_ranks(sp_group)
+            batch = broadcast_with_rlinf(
+                obj=batch,
+                group_ranks=group_ranks,
+                stage_name="actor_update",
+            )
+        if "response_mask" not in batch.batch.keys():
+            batch.batch["response_mask"] = compute_response_mask(batch)
+        old_log_prob = self.compute_log_prob(batch)
+        if "entropys" in old_log_prob.batch.keys():
+            old_log_prob.batch.pop("entropys")
+        batch = batch.union(old_log_prob)
+        if bool(train_flags.get("use_reference_policy", False)):
+            ref_log_prob = self.compute_ref_log_prob(batch)
+            batch = batch.union(ref_log_prob)
+        if not bool(train_flags.get("use_kl_in_reward", False)):
+            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+        if is_collect:
+            output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def channel_train_actor_update_stage(
+        self,
+        input_ch,
+        metrics_ch,
+        train_flags: dict,
+    ):
+        from verl.utils.metric import reduce_metrics
+
+        dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("actor", self.rank))
+        is_collect = bool(self.query_collect_info("actor"))
+        sp_group = self.ulysses_device_mesh["sp"].get_group() if self.ulysses_device_mesh is not None else None
+        if is_collect:
+            payload = input_ch.get(key=dp_rank, async_op=False)
+        else:
+            payload = None
+        if sp_group is not None:
+            group_ranks = dist.get_process_group_ranks(sp_group)
+            payload = broadcast_with_rlinf(
+                obj=payload,
+                group_ranks=group_ranks,
+                stage_name="actor_update",
+            )
+        if isinstance(payload, dict) and "batch" in payload:
+            batch = payload["batch"]
+            metrics = dict(payload.get("metrics", {}))
+        else:
+            batch = payload
+            metrics = {}
+
+        global_steps = int(train_flags.get("global_steps", 0))
+        critic_warmup = int(train_flags.get("critic_warmup", 0))
+        actor_updated = False
+        if global_steps >= critic_warmup:
+            actor_output = self.update_actor(batch)
+            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+            actor_updated = True
+
+        mean_reward = float(batch.batch["token_level_rewards"].sum(dim=-1).mean().item())
+        metrics.update(
+            {
+                "channel/dp_rank": dp_rank,
+                "channel/actor_updated": 1.0 if actor_updated else 0.0,
+                "train/mean_token_level_reward": mean_reward,
+            }
+        )
+        if is_collect:
+            metrics_ch.put(metrics, weight=0, key=dp_rank, async_op=False)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank
 
@@ -1686,6 +1796,59 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def channel_train_critic_stage(
+        self,
+        input_ch,
+        output_ch,
+        train_flags: dict,
+    ):
+        import torch.distributed as dist
+
+        from verl.trainer.ppo.ray_trainer import compute_advantage
+        from verl.utils.metric import reduce_metrics
+
+        dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("critic", self.rank))
+        is_collect = bool(self.query_collect_info("critic"))
+        sp_group = self.ulysses_device_mesh["sp"].get_group() if self.ulysses_device_mesh is not None else None
+        if is_collect:
+            batch = input_ch.get(key=dp_rank, async_op=False)
+        else:
+            batch = None
+        if sp_group is not None:
+            group_ranks = dist.get_process_group_ranks(sp_group)
+            batch = broadcast_with_rlinf(
+                obj=batch,
+                group_ranks=group_ranks,
+                stage_name="critic_stage",
+            )
+
+        use_critic = bool(train_flags.get("use_critic", True))
+        if use_critic:
+            values = self.compute_values(batch)
+            batch = batch.union(values)
+
+        if "token_level_rewards" not in batch.batch.keys():
+            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+        batch = compute_advantage(
+            batch,
+            adv_estimator=train_flags["adv_estimator"],
+            gamma=float(train_flags["gamma"]),
+            lam=float(train_flags["lam"]),
+            num_repeat=int(train_flags["rollout_n"]),
+            norm_adv_by_std_in_grpo=bool(train_flags["norm_adv_by_std_in_grpo"]),
+            config=train_flags["algorithm_config"],
+        )
+
+        metrics = {}
+        if use_critic:
+            critic_output = self.update_critic(batch)
+            metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
+
+        if is_collect:
+            output_ch.put({"batch": batch, "metrics": metrics}, weight=0, key=dp_rank, async_op=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

@@ -346,3 +346,14 @@ class Worker(WorkerHelper):
         """
         result = func(*args, **kwargs)
         return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_channel_worker_context(self, group_name: str):
+        """Attach an RLinf worker context in current Ray actor process.
+
+        This enables RLinf Channel operations in worker methods to use worker send/recv
+        communication path (e.g. NCCL-capable) instead of Ray-only fallback.
+        """
+        from verl.third_party.rlinf.worker_adapter import create_rlinf_worker
+
+        create_rlinf_worker(group_name=group_name, rank=self.rank, world_size=self.world_size)
