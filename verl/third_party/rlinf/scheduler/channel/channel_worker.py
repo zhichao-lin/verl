@@ -512,37 +512,51 @@ class ChannelWorker(Worker):
         """A background task that cleans up memory when triggered."""
         mem_util_after_clean = 1.0
         current_mem_util = 1.0
-        mem_clean_threshold = ChannelWorker.MEM_CLEAN_THRESHOLD
+        mem_clean_threshold_by_device: dict[int, float] = {}
         while True:
             await asyncio.sleep(ChannelWorker.MEM_CLEAN_PERIOD_SECONDS)
             if self.has_accelerator and Worker.torch_platform.is_initialized():
-                memory_reserved = Worker.torch_platform.memory_reserved()
-                memory_allocated = Worker.torch_platform.memory_allocated()
-                current_mem_util = (
-                    memory_allocated / memory_reserved if memory_reserved > 0 else 1.0
-                )
-                if current_mem_util < mem_clean_threshold:
-                    gc.collect()
-                    Worker.torch_platform.synchronize()
-                    Worker.torch_platform.empty_cache()
-                    memory_reserved = Worker.torch_platform.memory_reserved()
-                    memory_allocated = Worker.torch_platform.memory_allocated()
-                    mem_util_after_clean = (
-                        memory_allocated / memory_reserved
-                        if memory_reserved > 0
-                        else 1.0
-                    )
-                    if mem_util_after_clean < mem_clean_threshold:
-                        mem_clean_threshold = mem_util_after_clean
-                        self.log_debug(
-                            f"ChannelWorker memory cleaned but still below threshold. Updated MEM_CLEAN_THRESHOLD to {mem_clean_threshold:.2f}"
-                        )
-                    else:
-                        mem_clean_threshold = ChannelWorker.MEM_CLEAN_THRESHOLD
+                origin_device = Worker.torch_platform.current_device()
+                try:
+                    device_count = Worker.torch_platform.device_count()
+                    for dev_idx in range(device_count):
+                        if Worker.torch_platform.current_device() != dev_idx:
+                            Worker.torch_platform.set_device(dev_idx)
 
-                    self.log_debug(
-                        f"ChannelWorker memory after cleanup {Worker.torch_platform.memory_allocated()}, {Worker.torch_platform.memory_reserved()}"
-                    )
+                        mem_clean_threshold = mem_clean_threshold_by_device.get(
+                            dev_idx, ChannelWorker.MEM_CLEAN_THRESHOLD
+                        )
+                        memory_reserved = Worker.torch_platform.memory_reserved()
+                        memory_allocated = Worker.torch_platform.memory_allocated()
+                        current_mem_util = (
+                            memory_allocated / memory_reserved if memory_reserved > 0 else 1.0
+                        )
+                        if current_mem_util < mem_clean_threshold:
+                            gc.collect()
+                            Worker.torch_platform.synchronize()
+                            Worker.torch_platform.empty_cache()
+                            memory_reserved = Worker.torch_platform.memory_reserved()
+                            memory_allocated = Worker.torch_platform.memory_allocated()
+                            mem_util_after_clean = (
+                                memory_allocated / memory_reserved
+                                if memory_reserved > 0
+                                else 1.0
+                            )
+                            if mem_util_after_clean < mem_clean_threshold:
+                                mem_clean_threshold = mem_util_after_clean
+                                self.log_debug(
+                                    f"ChannelWorker device {dev_idx} memory cleaned but still below threshold. Updated MEM_CLEAN_THRESHOLD to {mem_clean_threshold:.2f}"
+                                )
+                            else:
+                                mem_clean_threshold = ChannelWorker.MEM_CLEAN_THRESHOLD
+                            mem_clean_threshold_by_device[dev_idx] = mem_clean_threshold
+
+                            self.log_debug(
+                                f"ChannelWorker device {dev_idx} memory after cleanup {Worker.torch_platform.memory_allocated()}, {Worker.torch_platform.memory_reserved()}"
+                            )
+                finally:
+                    if Worker.torch_platform.current_device() != origin_device:
+                        Worker.torch_platform.set_device(origin_device)
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Get the current device memory usage of the ChannelWorker.

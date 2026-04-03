@@ -421,7 +421,7 @@ class Channel:
             When a key is given, the channel will put the item in the queue associated with that key.
             If the queue associated with the key does not exist, it will be created.
             async_op (bool): Whether to perform the operation asynchronously.
-            deepcopy (bool): Whether to deepcopy the item. Defaults to True.
+            deepcopy (bool): Whether to deepcopy the item. Defaults to False.
         """
         item = copy.deepcopy(item) if deepcopy else item
         if self._local_channel is not None:

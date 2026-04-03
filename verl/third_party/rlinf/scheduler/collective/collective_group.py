@@ -35,6 +35,7 @@ from ..cluster.utils import (
 )
 from ..manager import CollectiveGroupInfo, CollectiveManager, WorkerInfo
 from ..worker import Worker, WorkerAddress
+from ..hardware import AcceleratorUtil
 from .async_work import AsyncFuncWork, AsyncWork
 
 if TYPE_CHECKING:
@@ -1152,6 +1153,9 @@ class CollectiveGroup:
         tensor_device = str(
             Worker.torch_platform.get_device_properties(tensor.device).uuid
         )
+        if tensor_device == 'None':
+            visible_devices = AcceleratorUtil.get_visible_devices(Worker.accelerator_type)
+            tensor_device = str(visible_devices[tensor.device.index])
         device_tensor, device_tensor_size = self._object_to_tensor(tensor_device, "cpu")
         send_work = self._send(
             device_tensor_size,
@@ -1209,6 +1213,9 @@ class CollectiveGroup:
         tensor_device = str(
             Worker.torch_platform.get_device_properties(tensor.device).uuid
         )
+        if tensor_device == 'None':
+            visible_devices = AcceleratorUtil.get_visible_devices(Worker.accelerator_type)
+            tensor_device = str(visible_devices[tensor.device.index])
         device_tensor, device_tensor_size = self._object_to_tensor(tensor_device, "cpu")
 
         peer_device_tensor_size = torch.empty(1, dtype=torch.long, device="cpu")
@@ -1307,6 +1314,12 @@ class CollectiveGroup:
         )
         tensor_handles = self._tensor_to_object(handles_tensor, handles_tensor_size)
 
+        # device index of sender and receiver might be different, but they point to the same device
+        for i, (rebuild_func, rebuild_args) in enumerate(tensor_handles):
+            if len(rebuild_args) == 15:
+                new_args = list(rebuild_args)
+                new_args[6] = Worker.torch_platform.current_device()
+                tensor_handles[i] = (rebuild_func, new_args)
         remote_tensors = [
             rebuild_func(*rebuild_args)
             for (rebuild_func, rebuild_args) in tensor_handles
@@ -1332,10 +1345,13 @@ class CollectiveGroup:
     ):
         """For handling same device send/recv in _send_tensor_list."""
         # Exchange tensor device info
-        devices = [
-            str(Worker.torch_platform.get_device_properties(tensor.device).uuid)
-            for tensor in tensors
-        ]
+        devices = []
+        for tensor in tensors:
+            device = str(Worker.torch_platform.get_device_properties(tensor.device).uuid)
+            if device == 'None':
+                visible_devices = AcceleratorUtil.get_visible_devices(Worker.accelerator_type)
+                device = str(visible_devices[tensor.device.index])
+            devices.append(device)
 
         devices_tensor, devices_tensor_size = self._object_to_tensor(devices, "cpu")
         send_work = self._send(
@@ -1407,7 +1423,7 @@ class CollectiveGroup:
             peer_tensor_devices_tensor, peer_tensor_devices_tensor_size
         )
 
-        # If all peer tensor device UUIDs are identical and that device is available on this
+        # If all peer tensor devices are the same and that device is available on this
         # worker, switch current_device to enable IPC instead of falling back to NCCL.
         #
         # This is especially useful when the two workers have overlapping accelerators
@@ -1416,32 +1432,27 @@ class CollectiveGroup:
             isinstance(peer_tensor_devices, list)
             and len(peer_tensor_devices) > 0
             and len(set(peer_tensor_devices)) == 1
-            and Worker.torch_platform is not None
         ):
-            peer_device_uuid = peer_tensor_devices[0]
-            device_count = (
-                Worker.torch_platform.device_count()
-                if hasattr(Worker.torch_platform, "device_count")
-                else 0
-            )
+            peer_device = peer_tensor_devices[0]
+            device_count = Worker.torch_platform.device_count()
+
             target_dev_idx = None
             for dev_idx in range(device_count):
-                try:
-                    uuid = str(Worker.torch_platform.get_device_properties(dev_idx).uuid)
-                except Exception:
-                    continue
-                if uuid == peer_device_uuid:
+                device = str(Worker.torch_platform.get_device_properties(dev_idx).uuid)
+                if device == 'None':
+                    visible_devices = AcceleratorUtil.get_visible_devices(Worker.accelerator_type)
+                    device = str(visible_devices[dev_idx])
+                if device == peer_device:
                     target_dev_idx = dev_idx
                     break
 
             if (
                 target_dev_idx is not None
-                and hasattr(Worker.torch_platform, "set_device")
                 and Worker.torch_platform.current_device() != target_dev_idx
             ):
                 self._logger.debug(
                     f"Switching current device from {Worker.torch_platform.current_device()} to {target_dev_idx} "
-                    f"to match peer device UUID {peer_device_uuid} for IPC recv"
+                    f"to match peer device {peer_device} for IPC recv"
                 )
                 Worker.torch_platform.set_device(target_dev_idx)
 
@@ -1450,6 +1461,9 @@ class CollectiveGroup:
                 Worker.torch_platform.current_device()
             ).uuid
         )
+        if current_device == 'None':
+            visible_devices = AcceleratorUtil.get_visible_devices(Worker.accelerator_type)
+            current_device = str(visible_devices[Worker.torch_platform.current_device()])
         device_tensor, device_tensor_size = self._object_to_tensor(
             current_device, "cpu"
         )
