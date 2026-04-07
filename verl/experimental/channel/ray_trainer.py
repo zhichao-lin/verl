@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from pprint import pprint
 from typing import Any
 
 import numpy as np
@@ -403,7 +404,10 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
         self._driver_full_batch_reflow_count = 0
         t0 = time.perf_counter()
         self.put_rollout_inputs_per_dp_rank(batches)
+
         self.async_rollout_manager.generate_sequences(self.rollout_input_ch, self.rollout_output_ch)
+        self.checkpoint_manager.sleep_replicas()
+
         self.run_reward_stage_all_dp_ranks()
         self.run_train_stage_all_dp_ranks(train_config)
         merged = self.aggregate_metrics_from_channel()
@@ -427,7 +431,6 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
     def fit(self):
         """Minimal channel-mode fit loop for integration."""
         from omegaconf import OmegaConf
-        from pprint import pprint
 
         from verl.utils.tracking import Tracking
 
@@ -439,11 +442,15 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
+
+        # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
@@ -452,27 +459,37 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
+        # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # we start from step 1
         self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+                # add uid to batch
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
+
+                gen_batch = self._get_gen_batch(batch)
+
+                # pass global_steps to trace
+                gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch_output = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
-                batch = DataProto.from_single_dict(batch_dict)
-                if "uid" not in batch.non_tensor_batch:
-                    batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                    )
-                gen_batch = self._get_gen_batch(batch)
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n,
-                    interleave=True,
-                )
-                gen_batch_padded, _ = pad_dataproto_to_divisor(gen_batch, self.dp_size)
-                shard_len = len(gen_batch_padded) // self.dp_size
-                shards = [gen_batch_padded[i * shard_len : (i + 1) * shard_len] for i in range(self.dp_size)]
+                assert len(gen_batch_output) % self.dp_size == 0, f"{len(gen_batch_output)=}, {self.dp_size=}"
+                shard_len = len(gen_batch_output) // self.dp_size
+                shards = [gen_batch_output[i * shard_len : (i + 1) * shard_len] for i in range(self.dp_size)]
 
                 metrics = self.run_channel_step(shards, train_config={"global_steps": self.global_steps})
                 metrics.update({"training/global_step": self.global_steps, "training/epoch": epoch})
@@ -487,13 +504,18 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
                 if self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
-                    metrics.update(self._validate())
+                    val_metrics: dict = self._validate()
+                    if is_last_step:
+                        last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
 
                 logger.log(data=metrics, step=self.global_steps)
+
                 progress_bar.update(1)
                 self.global_steps += 1
 
                 if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 

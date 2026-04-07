@@ -1303,6 +1303,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 group_ranks=group_ranks,
                 stage_name="actor_update",
             )
+
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
         old_log_prob = self.compute_log_prob(batch)
@@ -1347,6 +1348,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 group_ranks=group_ranks,
                 stage_name="ref_log_prob",
             )
+
         ref_log_prob = self.compute_ref_log_prob(batch)
         batch = batch.union(ref_log_prob)
         if not bool(train_flags.get("use_kl_in_reward", False)):
@@ -1378,6 +1380,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 group_ranks=group_ranks,
                 stage_name="post_reward_actor",
             )
+
         batch = _channel_maybe_apply_rollout_bypass(batch, train_flags)
         _channel_fill_batch_meta_for_training(batch)
         batch = _channel_post_reward_adv_block(self, batch, train_flags)
@@ -1407,6 +1410,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 group_ranks=group_ranks,
                 stage_name="actor_update",
             )
+
         if isinstance(payload, dict) and "batch" in payload:
             batch = payload["batch"]
             metrics = dict(payload.get("metrics", {}))
