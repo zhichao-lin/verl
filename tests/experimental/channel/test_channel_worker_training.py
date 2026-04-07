@@ -14,10 +14,14 @@
 
 """Task5: training stage reads reward_output (key=dp_rank) and writes metrics (key=dp_rank)."""
 
+from __future__ import annotations
+
+import os
 from unittest.mock import MagicMock
 
-import torch
-from tensordict import TensorDict
+# Before NumPy/Torch import (MKL FPE abort on some Windows CPUs); see also ``conftest.py``.
+# Do not import ``torch`` / ``tensordict`` at module level: import order matters; use lazy imports in tests.
+os.environ.setdefault("NPY_DISABLE_CPU_FEATURES", "1")
 
 from verl.experimental.channel.ray_trainer import CHANNEL_METRICS, CHANNEL_REWARD_OUTPUT, ChannelRayPPOTrainer
 from verl.experimental.channel.reward_worker import reward_output_put
@@ -37,6 +41,9 @@ def _create_local_channel(name: str, maxsize: int = 0):
 
 
 def _proto_after_reward_stage() -> DataProto:
+    import torch
+    from tensordict import TensorDict
+
     rm = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32)
     scores = torch.zeros_like(rm)
     return DataProto(
@@ -78,8 +85,11 @@ def test_trainer_run_train_stage_and_get_metrics_match_dp_keys():
     trainer.critic_wg = MagicMock()
     trainer.reward_output_ch = MagicMock()
     trainer.train_actor_prep_ch = MagicMock()
+    trainer.train_after_ref_ch = MagicMock()
+    trainer.train_post_reward_out_ch = MagicMock()
     trainer.train_actor_update_in_ch = MagicMock()
     trainer.metrics_ch = MagicMock()
+    trainer.ref_policy_wg = None
     trainer.config = MagicMock()
     trainer.config.algorithm.use_kl_in_reward = False
     trainer.config.algorithm.adv_estimator = AdvantageEstimator.GAE
@@ -94,8 +104,60 @@ def test_trainer_run_train_stage_and_get_metrics_match_dp_keys():
     trainer.actor_rollout_wg.channel_train_prepare_from_reward.assert_called_once_with(
         trainer.reward_output_ch,
         trainer.train_actor_prep_ch,
-        {"use_reference_policy": True, "use_kl_in_reward": False},
+        {"use_reference_policy": True, "use_kl_in_reward": False, "compute_ref_on_actor": True},
     )
+    trainer.critic_wg.channel_train_post_reward_stage.assert_called_once()
+    trainer.critic_wg.channel_train_critic_stage.assert_called_once()
+    trainer.actor_rollout_wg.channel_train_actor_update_stage.assert_called_once()
+
+
+def test_trainer_separate_ref_wg_calls_ref_channel_stage_and_skips_ref_on_actor():
+    """When ``ref_policy_wg`` is not ``actor_rollout_wg``, ref log-probs run only via ``channel_train_ref_log_prob_stage``."""
+    trainer = object.__new__(ChannelRayPPOTrainer)
+    trainer.use_critic = True
+    trainer.use_reference_policy = True
+    trainer.global_steps = 1
+    trainer.actor_rollout_wg = MagicMock()
+    trainer.ref_policy_wg = MagicMock()
+    assert trainer.ref_policy_wg is not trainer.actor_rollout_wg
+    trainer.critic_wg = MagicMock()
+    trainer.reward_output_ch = MagicMock()
+    trainer.train_actor_prep_ch = MagicMock()
+    trainer.train_after_ref_ch = MagicMock()
+    trainer.train_post_reward_out_ch = MagicMock()
+    trainer.train_actor_update_in_ch = MagicMock()
+    trainer.metrics_ch = MagicMock()
+    trainer.config = MagicMock()
+    trainer.config.algorithm.use_kl_in_reward = False
+    trainer.config.algorithm.adv_estimator = AdvantageEstimator.GAE
+    trainer.config.algorithm.gamma = 1.0
+    trainer.config.algorithm.lam = 1.0
+    trainer.config.algorithm.get.return_value = True
+    trainer.config.actor_rollout_ref.rollout.n = 1
+    trainer.config.actor_rollout_ref.actor.policy_loss = MagicMock()
+    trainer.config.trainer.critic_warmup = 0
+
+    trainer.run_train_stage_all_dp_ranks({})
+
+    trainer.actor_rollout_wg.channel_train_prepare_from_reward.assert_called_once_with(
+        trainer.reward_output_ch,
+        trainer.train_actor_prep_ch,
+        {"use_reference_policy": True, "use_kl_in_reward": False, "compute_ref_on_actor": False},
+    )
+    trainer.ref_policy_wg.channel_train_ref_log_prob_stage.assert_called_once_with(
+        trainer.train_actor_prep_ch,
+        trainer.train_after_ref_ch,
+        {"use_kl_in_reward": False},
+    )
+    trainer.critic_wg.channel_train_post_reward_stage.assert_called_once()
+    pr_call = trainer.critic_wg.channel_train_post_reward_stage.call_args[0]
+    assert pr_call[0] is trainer.train_after_ref_ch
+    assert pr_call[1] is trainer.train_post_reward_out_ch
+    assert pr_call[2]["use_kl_in_reward"] is False
+    assert pr_call[2]["rollout_n"] == 1
+    assert pr_call[2]["policy_loss_config"] is trainer.config.actor_rollout_ref.actor.policy_loss
+
+    trainer.actor_rollout_wg.channel_train_post_reward_stage.assert_not_called()
     trainer.critic_wg.channel_train_critic_stage.assert_called_once()
     trainer.actor_rollout_wg.channel_train_actor_update_stage.assert_called_once()
 
@@ -110,8 +172,11 @@ def test_trainer_prefers_worker_channel_pipeline_without_driver_batch_pull():
     trainer.critic_wg = MagicMock()
     trainer.reward_output_ch = _create_local_channel("RewardOutputWorkerPipeline")
     trainer.train_actor_prep_ch = _create_local_channel("TrainActorPrepWorkerPipeline")
+    trainer.train_after_ref_ch = _create_local_channel("TrainAfterRefWorkerPipeline")
+    trainer.train_post_reward_out_ch = _create_local_channel("TrainPostRewardOutWorkerPipeline")
     trainer.train_critic_in_ch = _create_local_channel("TrainCriticInWorkerPipeline")
     trainer.train_actor_update_in_ch = _create_local_channel("TrainActorUpdateInWorkerPipeline")
+    trainer.ref_policy_wg = None
     trainer.metrics_ch = _create_local_channel("MetricsWorkerPipeline")
     trainer.config = MagicMock()
     trainer.config.algorithm.use_kl_in_reward = False
@@ -126,10 +191,14 @@ def test_trainer_prefers_worker_channel_pipeline_without_driver_batch_pull():
 
     assert trainer.actor_rollout_wg.channel_train_prepare_from_reward.call_count == 1
     assert trainer.actor_rollout_wg.channel_train_actor_update_stage.call_count == 1
+    trainer.critic_wg.channel_train_post_reward_stage.assert_called_once()
     trainer.critic_wg.channel_train_critic_stage.assert_called_once()
 
 
 def test_run_training_from_channel_executes_full_ppo_flow_when_trainer_provided():
+    import torch
+    from tensordict import TensorDict
+
     reward_ch = _create_local_channel(f"{CHANNEL_REWARD_OUTPUT}Task5FullFlow")
     metrics_ch = _create_local_channel(f"{CHANNEL_METRICS}Task5FullFlow")
     dp_rank = 0

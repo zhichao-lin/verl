@@ -103,7 +103,7 @@ def create_rlinf_worker(group_name: str, rank: int, world_size: int):
             catch_system_failure=False,
         )
     elif _RLINF_WORKER.group_name != group_name:
-        raise RuntimeError(
+        warnings.warn(
             "create_rlinf_worker called with different group_name in the same process: "
             f"existing={_RLINF_WORKER.group_name}, requested={group_name}"
         )

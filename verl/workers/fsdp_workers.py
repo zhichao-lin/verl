@@ -98,6 +98,94 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _channel_fill_batch_meta_for_training(batch: DataProto) -> None:
+    """Mirror driver-side meta_info used by actor/critic updates (:class:`~verl.trainer.ppo.ray_trainer.RayPPOTrainer`)."""
+    import torch
+
+    if "attention_mask" in batch.batch.keys() and "global_token_num" not in batch.meta_info:
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+    if "multi_modal_inputs" in batch.non_tensor_batch and "images_seqlens" not in batch.meta_info:
+        images_seqlens_all = []
+        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+            if "image_grid_thw" not in multi_modal_input.keys():
+                continue
+            images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+        batch.meta_info["images_seqlens"] = images_seqlens_all
+
+
+def _channel_maybe_apply_rollout_bypass(batch: DataProto, train_flags: dict) -> DataProto:
+    """Rollout-correction bypass mode before value / advantage (order matches :class:`~verl.trainer.ppo.ray_trainer.RayPPOTrainer`)."""
+    algo_cfg = train_flags["algorithm_config"]
+    rollout_corr_config = None
+    if hasattr(algo_cfg, "get"):
+        rollout_corr_config = algo_cfg.get("rollout_correction", None)
+    if rollout_corr_config is None and hasattr(algo_cfg, "rollout_correction"):
+        rollout_corr_config = algo_cfg.rollout_correction
+
+    bypass_recomputing_logprobs = bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
+    policy_loss_config = train_flags.get("policy_loss_config")
+
+    if bypass_recomputing_logprobs and policy_loss_config is not None:
+        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+        apply_bypass_mode(
+            batch=batch,
+            rollout_corr_config=rollout_corr_config,
+            policy_loss_config=policy_loss_config,
+        )
+    return batch
+
+
+def _channel_post_reward_adv_block(worker, batch: DataProto, train_flags: dict) -> DataProto:
+    """KL in reward, decoupled rollout correction, then :func:`~verl.trainer.ppo.ray_trainer.compute_advantage`."""
+    from verl.trainer.ppo import core_algos
+    from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage
+
+    algo_cfg = train_flags["algorithm_config"]
+    use_kl_in_reward = bool(train_flags.get("use_kl_in_reward", False))
+    rollout_corr_config = None
+    if hasattr(algo_cfg, "get"):
+        rollout_corr_config = algo_cfg.get("rollout_correction", None)
+    if rollout_corr_config is None and hasattr(algo_cfg, "rollout_correction"):
+        rollout_corr_config = algo_cfg.rollout_correction
+
+    bypass_recomputing_logprobs = bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
+
+    if use_kl_in_reward:
+        if getattr(worker, "_channel_kl_ctrl_in_reward", None) is None:
+            kl_cfg = algo_cfg.kl_ctrl if hasattr(algo_cfg, "kl_ctrl") else algo_cfg["kl_ctrl"]
+            worker._channel_kl_ctrl_in_reward = core_algos.get_kl_controller(kl_cfg)
+        kl_penalty = algo_cfg.kl_penalty if hasattr(algo_cfg, "kl_penalty") else algo_cfg["kl_penalty"]
+        batch, _ = apply_kl_penalty(
+            batch,
+            kl_ctrl=worker._channel_kl_ctrl_in_reward,
+            kl_penalty=kl_penalty,
+        )
+    else:
+        if "token_level_rewards" not in batch.batch.keys():
+            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+    if (
+        rollout_corr_config is not None
+        and "rollout_log_probs" in batch.batch
+        and not bypass_recomputing_logprobs
+    ):
+        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+        batch, _ = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+
+    batch = compute_advantage(
+        batch,
+        adv_estimator=train_flags["adv_estimator"],
+        gamma=float(train_flags["gamma"]),
+        lam=float(train_flags["lam"]),
+        num_repeat=int(train_flags["rollout_n"]),
+        norm_adv_by_std_in_grpo=bool(train_flags["norm_adv_by_std_in_grpo"]),
+        config=algo_cfg,
+    )
+    return batch
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -1221,11 +1309,78 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if "entropys" in old_log_prob.batch.keys():
             old_log_prob.batch.pop("entropys")
         batch = batch.union(old_log_prob)
-        if bool(train_flags.get("use_reference_policy", False)):
+        # Reference log-probs must run on RefPolicy workers when ref is a separate process; see
+        # :meth:`channel_train_ref_log_prob_stage`.
+        compute_ref_on_actor = bool(train_flags.get("compute_ref_on_actor", True))
+        if bool(train_flags.get("use_reference_policy", False)) and compute_ref_on_actor:
             ref_log_prob = self.compute_ref_log_prob(batch)
             batch = batch.union(ref_log_prob)
         if not bool(train_flags.get("use_kl_in_reward", False)):
             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+        if is_collect:
+            output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def channel_train_ref_log_prob_stage(
+        self,
+        input_ch,
+        output_ch,
+        train_flags: dict,
+    ):
+        """RefPolicy worker only: read shard from ``input_ch``, attach ``ref_log_prob``, write to ``output_ch``."""
+        if not self._is_ref:
+            raise RuntimeError(
+                "channel_train_ref_log_prob_stage must run on a standalone RefPolicy worker "
+                "(ActorRolloutRefWorker with role='ref')."
+            )
+        dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("actor", self.rank))
+        is_collect = bool(self.query_collect_info("actor"))
+        sp_group = self.ulysses_device_mesh["sp"].get_group() if self.ulysses_device_mesh is not None else None
+        if is_collect:
+            batch = input_ch.get(key=dp_rank, async_op=False)
+        else:
+            batch = None
+        if sp_group is not None:
+            group_ranks = dist.get_process_group_ranks(sp_group)
+            batch = broadcast_with_rlinf(
+                obj=batch,
+                group_ranks=group_ranks,
+                stage_name="ref_log_prob",
+            )
+        ref_log_prob = self.compute_ref_log_prob(batch)
+        batch = batch.union(ref_log_prob)
+        if not bool(train_flags.get("use_kl_in_reward", False)):
+            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+        if is_collect:
+            output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def channel_train_post_reward_stage(
+        self,
+        input_ch,
+        output_ch,
+        train_flags: dict,
+    ):
+        """Post-reward pipeline on **actor** worker when ``use_critic=False`` (advantage without critic)."""
+        if not self._is_actor:
+            raise RuntimeError("channel_train_post_reward_stage (actor) requires an actor worker.")
+        dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("actor", self.rank))
+        is_collect = bool(self.query_collect_info("actor"))
+        sp_group = self.ulysses_device_mesh["sp"].get_group() if self.ulysses_device_mesh is not None else None
+        if is_collect:
+            batch = input_ch.get(key=dp_rank, async_op=False)
+        else:
+            batch = None
+        if sp_group is not None:
+            group_ranks = dist.get_process_group_ranks(sp_group)
+            batch = broadcast_with_rlinf(
+                obj=batch,
+                group_ranks=group_ranks,
+                stage_name="post_reward_actor",
+            )
+        batch = _channel_maybe_apply_rollout_bypass(batch, train_flags)
+        _channel_fill_batch_meta_for_training(batch)
+        batch = _channel_post_reward_adv_block(self, batch, train_flags)
         if is_collect:
             output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
@@ -1798,15 +1953,48 @@ class CriticWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def channel_train_post_reward_stage(
+        self,
+        input_ch,
+        output_ch,
+        train_flags: dict,
+    ):
+        """Values + KL / rollout-correction + advantage on **critic** worker (when ``use_critic=True``)."""
+        import torch.distributed as dist
+
+        dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("critic", self.rank))
+        is_collect = bool(self.query_collect_info("critic"))
+        sp_group = self.ulysses_device_mesh["sp"].get_group() if self.ulysses_device_mesh is not None else None
+        if is_collect:
+            batch = input_ch.get(key=dp_rank, async_op=False)
+        else:
+            batch = None
+        if sp_group is not None:
+            group_ranks = dist.get_process_group_ranks(sp_group)
+            batch = broadcast_with_rlinf(
+                obj=batch,
+                group_ranks=group_ranks,
+                stage_name="post_reward_critic",
+            )
+
+        batch = _channel_maybe_apply_rollout_bypass(batch, train_flags)
+        _channel_fill_batch_meta_for_training(batch)
+        values = self.compute_values(batch)
+        batch = batch.union(values)
+        batch = _channel_post_reward_adv_block(self, batch, train_flags)
+        if is_collect:
+            output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def channel_train_critic_stage(
         self,
         input_ch,
         output_ch,
         train_flags: dict,
     ):
+        """Critic update only; batch must already contain advantages (from :meth:`channel_train_post_reward_stage`)."""
         import torch.distributed as dist
 
-        from verl.trainer.ppo.ray_trainer import compute_advantage
         from verl.utils.metric import reduce_metrics
 
         dp_rank = int(self.get_dispatch_collect()["dispatch_dp_rank"].get("critic", self.rank))
@@ -1821,27 +2009,10 @@ class CriticWorker(Worker, DistProfilerExtension):
             batch = broadcast_with_rlinf(
                 obj=batch,
                 group_ranks=group_ranks,
-                stage_name="critic_stage",
+                stage_name="critic_update",
             )
 
         use_critic = bool(train_flags.get("use_critic", True))
-        if use_critic:
-            values = self.compute_values(batch)
-            batch = batch.union(values)
-
-        if "token_level_rewards" not in batch.batch.keys():
-            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-        batch = compute_advantage(
-            batch,
-            adv_estimator=train_flags["adv_estimator"],
-            gamma=float(train_flags["gamma"]),
-            lam=float(train_flags["lam"]),
-            num_repeat=int(train_flags["rollout_n"]),
-            norm_adv_by_std_in_grpo=bool(train_flags["norm_adv_by_std_in_grpo"]),
-            config=train_flags["algorithm_config"],
-        )
-
         metrics = {}
         if use_critic:
             critic_output = self.update_critic(batch)

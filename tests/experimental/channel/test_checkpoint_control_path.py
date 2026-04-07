@@ -14,7 +14,10 @@
 
 """Task8: checkpoint / weight sync stay on RPC control plane, not channel data path."""
 
+import os
 from unittest.mock import MagicMock, patch
+
+os.environ.setdefault("NPY_DISABLE_CPU_FEATURES", "1")
 
 from verl.experimental.channel.ray_trainer import ChannelRayPPOTrainer
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer

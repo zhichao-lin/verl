@@ -42,6 +42,8 @@ CHANNEL_REWARD_OUTPUT = "RewardOutput"
 CHANNEL_METRICS = "Metrics"
 CHANNEL_VAL_SUMMARY = "ValSummary"
 CHANNEL_TRAIN_ACTOR_PREP = "TrainActorPrep"
+CHANNEL_TRAIN_AFTER_REF = "TrainAfterRef"
+CHANNEL_TRAIN_POST_REWARD_OUT = "TrainPostRewardOut"
 CHANNEL_TRAIN_CRITIC_IN = "TrainCriticIn"
 CHANNEL_TRAIN_ACTOR_UPDATE_IN = "TrainActorUpdateIn"
 
@@ -102,6 +104,10 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
         self.metrics_ch = Channel.create(name=CHANNEL_METRICS, distributed=distributed, local=False)
         self.val_summary_ch = Channel.create(name=CHANNEL_VAL_SUMMARY, distributed=distributed, local=False)
         self.train_actor_prep_ch = Channel.create(name=CHANNEL_TRAIN_ACTOR_PREP, distributed=distributed, local=False)
+        self.train_after_ref_ch = Channel.create(name=CHANNEL_TRAIN_AFTER_REF, distributed=distributed, local=False)
+        self.train_post_reward_out_ch = Channel.create(
+            name=CHANNEL_TRAIN_POST_REWARD_OUT, distributed=distributed, local=False
+        )
         self.train_critic_in_ch = Channel.create(name=CHANNEL_TRAIN_CRITIC_IN, distributed=distributed, local=False)
         self.train_actor_update_in_ch = Channel.create(
             name=CHANNEL_TRAIN_ACTOR_UPDATE_IN, distributed=distributed, local=False
@@ -179,38 +185,77 @@ class ChannelRayPPOTrainer(RayPPOTrainer):
         """
         self._run_train_stage_via_worker_channels(dict(train_config or {}))
 
+    def _separate_ref_worker(self) -> bool:
+        """True when reference policy runs in a dedicated worker group (not colocated with actor)."""
+        ref_wg = getattr(self, "ref_policy_wg", None)
+        actor_wg = getattr(self, "actor_rollout_wg", None)
+        return (
+            bool(self.use_reference_policy)
+            and ref_wg is not None
+            and actor_wg is not None
+            and ref_wg is not actor_wg
+        )
+
     def _run_train_stage_via_worker_channels(self, train_config: dict) -> None:
         """Run train stage as worker-to-worker channel pipeline."""
         actor_group = getattr(self, "actor_rollout_wg", None)
         if actor_group is None:
             raise RuntimeError("channel train stage requires actor_rollout_wg, but it is not initialized.")
+
+        separate_ref = self._separate_ref_worker()
+        compute_ref_on_actor = bool(self.use_reference_policy) and not separate_ref
+
         actor_group.channel_train_prepare_from_reward(
             self.reward_output_ch,
             self.train_actor_prep_ch,
             {
                 "use_reference_policy": bool(self.use_reference_policy),
                 "use_kl_in_reward": bool(self.config.algorithm.use_kl_in_reward),
+                "compute_ref_on_actor": compute_ref_on_actor,
             },
         )
 
+        if separate_ref:
+            self.ref_policy_wg.channel_train_ref_log_prob_stage(
+                self.train_actor_prep_ch,
+                self.train_after_ref_ch,
+                {"use_kl_in_reward": bool(self.config.algorithm.use_kl_in_reward)},
+            )
+            post_reward_in_ch = self.train_after_ref_ch
+        else:
+            post_reward_in_ch = self.train_actor_prep_ch
+
+        post_reward_flags = {
+            "use_kl_in_reward": bool(self.config.algorithm.use_kl_in_reward),
+            "algorithm_config": self.config.algorithm,
+            "adv_estimator": self.config.algorithm.adv_estimator,
+            "gamma": self.config.algorithm.gamma,
+            "lam": self.config.algorithm.lam,
+            "rollout_n": self.config.actor_rollout_ref.rollout.n,
+            "norm_adv_by_std_in_grpo": self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+            "policy_loss_config": self.config.actor_rollout_ref.actor.policy_loss,
+        }
+
         critic_group = getattr(self, "critic_wg", None)
         if critic_group is not None and self.use_critic:
+            critic_group.channel_train_post_reward_stage(
+                post_reward_in_ch,
+                self.train_post_reward_out_ch,
+                post_reward_flags,
+            )
             critic_group.channel_train_critic_stage(
-                self.train_actor_prep_ch,
+                self.train_post_reward_out_ch,
                 self.train_actor_update_in_ch,
-                {
-                    "adv_estimator": self.config.algorithm.adv_estimator,
-                    "gamma": self.config.algorithm.gamma,
-                    "lam": self.config.algorithm.lam,
-                    "rollout_n": self.config.actor_rollout_ref.rollout.n,
-                    "norm_adv_by_std_in_grpo": self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                    "algorithm_config": self.config.algorithm,
-                    "use_critic": bool(self.use_critic),
-                },
+                {"use_critic": bool(self.use_critic)},
             )
             actor_in_channel = self.train_actor_update_in_ch
         else:
-            actor_in_channel = self.train_actor_prep_ch
+            actor_group.channel_train_post_reward_stage(
+                post_reward_in_ch,
+                self.train_post_reward_out_ch,
+                post_reward_flags,
+            )
+            actor_in_channel = self.train_post_reward_out_ch
 
         actor_group.channel_train_actor_update_stage(
             actor_in_channel,

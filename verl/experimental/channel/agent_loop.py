@@ -58,6 +58,11 @@ class AgentLoopWorker(agent_loop.AgentLoopWorker):
         """
         batch = rollout_input_get(gen_input_channel, dp_rank)
         output = await super().generate_sequences(batch)
+        # Keep critical non-tensor fields (e.g. uid) for downstream GRPO advantage.
+        # Some agent-loop paths may not propagate full input_non_tensor_batch.
+        for key in ("uid", "data_source", "reward_model", "extra_info"):
+            if key in batch.non_tensor_batch and key not in output.non_tensor_batch:
+                output.non_tensor_batch[key] = batch.non_tensor_batch[key]
         rollout_output_put(gen_output_channel, output, dp_rank)
 
     def create_rlinf_worker(self, group_name: str, rank: int, world_size: int) -> None:

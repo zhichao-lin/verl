@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import os
 from unittest.mock import MagicMock, patch
+
+os.environ.setdefault("NPY_DISABLE_CPU_FEATURES", "1")
 
 from verl.experimental.channel.ray_trainer import ChannelRayPPOTrainer
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -31,7 +36,10 @@ def build_channel_trainer():
 
 
 @patch.object(RayPPOTrainer, "init_workers", _fake_ray_ppo_init_workers)
-def test_channel_topology_created_with_expected_names():
+@patch("verl.experimental.channel.ray_trainer.Channel.create")
+def test_channel_topology_created_with_expected_names(mock_channel_create):
+    """Avoid real RLinf ``Cluster`` / Ray bootstrap (non-portable on Windows)."""
+    mock_channel_create.side_effect = lambda *args, **kwargs: MagicMock()
     trainer = build_channel_trainer()
     trainer.init_workers()
     assert trainer.rollout_input_ch is not None
@@ -39,4 +47,6 @@ def test_channel_topology_created_with_expected_names():
     assert trainer.reward_output_ch is not None
     assert trainer.metrics_ch is not None
     assert trainer.val_summary_ch is not None
+    assert trainer.train_after_ref_ch is not None
+    assert trainer.train_post_reward_out_ch is not None
     assert trainer.dp_size == 2

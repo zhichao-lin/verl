@@ -1336,7 +1336,11 @@ class Worker(metaclass=WorkerMeta):
         This method is used to retrieve the worker properties without calling remote functions.
         """
         if self._actor is None and self._is_ray_actor:
-            self._actor = ray.get_actor(self._worker_name, namespace=Cluster.NAMESPACE)
+            try:
+                self._actor = ray.get_actor(self._worker_name, namespace=Cluster.NAMESPACE)
+            except ValueError:
+                self._logger.warning(f"Worker {self._worker_name} not found, using current actor")
+                self._actor = ray.get_runtime_context().current_actor
 
         node_ip = ray.util.get_node_ip_address()
 

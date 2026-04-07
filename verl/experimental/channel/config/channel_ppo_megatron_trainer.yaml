@@ -15,4 +15,5 @@ channel:
 actor_rollout_ref:
   rollout:
     agent:
+      num_workers: 4
       agent_loop_manager_class: verl.experimental.channel.agent_loop.AgentLoopManager
