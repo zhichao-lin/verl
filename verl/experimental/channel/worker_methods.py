@@ -21,6 +21,7 @@ from typing import Any, Mapping
 import torch
 
 from verl.protocol import DataProto
+from verl.experimental.channel.dataproto_channel_transport import dataproto_to_cpu_after_channel_get
 from verl.third_party.rlinf.scheduler.channel import Channel
 from verl.trainer.ppo.metric_utils import compute_data_metrics
 from verl.trainer.ppo.ray_trainer import agg_loss, apply_kl_penalty, compute_advantage, compute_response_mask
@@ -32,6 +33,7 @@ def reward_output_get_for_training(ch: Channel, dp_rank: int) -> DataProto:
     item = ch.get(key=dp_rank, async_op=False)
     if not isinstance(item, DataProto):
         raise TypeError(f"Expected DataProto from reward output channel, got {type(item)}")
+    dataproto_to_cpu_after_channel_get(item)
     return item
 
 

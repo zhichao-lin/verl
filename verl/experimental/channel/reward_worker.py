@@ -19,6 +19,10 @@ import numpy as np
 import torch
 
 from verl.protocol import DataProto
+from verl.experimental.channel.dataproto_channel_transport import (
+    dataproto_to_accel_for_channel_put,
+    dataproto_to_cpu_after_channel_get,
+)
 from verl.third_party.rlinf.scheduler.channel import Channel
 from verl.trainer.ppo.reward import extract_reward
 
@@ -28,11 +32,13 @@ def rollout_output_get(ch: Channel, dp_rank: int) -> DataProto:
     item = ch.get(key=dp_rank, async_op=False)
     if not isinstance(item, DataProto):
         raise TypeError(f"Expected DataProto from rollout output channel, got {type(item)}")
+    dataproto_to_cpu_after_channel_get(item)
     return item
 
 
 def reward_output_put(ch: Channel, batch: DataProto, dp_rank: int) -> None:
     """Worker：将含 ``token_level_scores`` 的 batch 写入 reward 输出 channel（``key=dp_rank``）。"""
+    dataproto_to_accel_for_channel_put(batch)
     ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
 

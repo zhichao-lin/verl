@@ -42,6 +42,11 @@ except ImportError:
     from torch.distributed._tensor import DTensor
 
 from verl import DataProto
+from verl.experimental.channel.dataproto_channel_transport import (
+    dataproto_to_accel_for_channel_put,
+    dataproto_to_cpu_after_channel_get,
+    stage_channel_payload_to_cpu_after_get,
+)
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
@@ -1304,6 +1309,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 stage_name="actor_update",
             )
 
+        dataproto_to_cpu_after_channel_get(batch)
+
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
         old_log_prob = self.compute_log_prob(batch)
@@ -1319,6 +1326,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not bool(train_flags.get("use_kl_in_reward", False)):
             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
         if is_collect:
+            dataproto_to_accel_for_channel_put(batch)
             output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1349,11 +1357,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 stage_name="ref_log_prob",
             )
 
+        dataproto_to_cpu_after_channel_get(batch)
+
         ref_log_prob = self.compute_ref_log_prob(batch)
         batch = batch.union(ref_log_prob)
         if not bool(train_flags.get("use_kl_in_reward", False)):
             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
         if is_collect:
+            dataproto_to_accel_for_channel_put(batch)
             output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1381,10 +1392,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 stage_name="post_reward_actor",
             )
 
+        dataproto_to_cpu_after_channel_get(batch)
+
         batch = _channel_maybe_apply_rollout_bypass(batch, train_flags)
         _channel_fill_batch_meta_for_training(batch)
         batch = _channel_post_reward_adv_block(self, batch, train_flags)
         if is_collect:
+            dataproto_to_accel_for_channel_put(batch)
             output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1410,6 +1424,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 group_ranks=group_ranks,
                 stage_name="actor_update",
             )
+
+        stage_channel_payload_to_cpu_after_get(payload)
 
         if isinstance(payload, dict) and "batch" in payload:
             batch = payload["batch"]
@@ -1981,12 +1997,15 @@ class CriticWorker(Worker, DistProfilerExtension):
                 stage_name="post_reward_critic",
             )
 
+        dataproto_to_cpu_after_channel_get(batch)
+
         batch = _channel_maybe_apply_rollout_bypass(batch, train_flags)
         _channel_fill_batch_meta_for_training(batch)
         values = self.compute_values(batch)
         batch = batch.union(values)
         batch = _channel_post_reward_adv_block(self, batch, train_flags)
         if is_collect:
+            dataproto_to_accel_for_channel_put(batch)
             output_ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -2016,6 +2035,8 @@ class CriticWorker(Worker, DistProfilerExtension):
                 stage_name="critic_update",
             )
 
+        dataproto_to_cpu_after_channel_get(batch)
+
         use_critic = bool(train_flags.get("use_critic", True))
         metrics = {}
         if use_critic:
@@ -2023,6 +2044,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
 
         if is_collect:
+            dataproto_to_accel_for_channel_put(batch)
             output_ch.put({"batch": batch, "metrics": metrics}, weight=0, key=dp_rank, async_op=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

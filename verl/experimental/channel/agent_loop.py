@@ -17,6 +17,10 @@ import ray
 from omegaconf import DictConfig
 import verl.experimental.agent_loop as agent_loop
 from verl.protocol import DataProto
+from verl.experimental.channel.dataproto_channel_transport import (
+    dataproto_to_accel_for_channel_put,
+    dataproto_to_cpu_after_channel_get,
+)
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
 from verl.third_party.rlinf.scheduler.channel import Channel
@@ -27,6 +31,7 @@ def rollout_input_put(ch: Channel, batch: DataProto, dp_rank: int) -> None:
     """Driver：按 ``dp_rank`` 投递一条 rollout 输入。与 :func:`rollout_input_get` 使用相同 ``key``。"""
     # 当前 Task2/3 使用 driver 侧 LocalChannel（同步 put）。后续若替换为分布式 Channel，
     # 可在此改为 async put / AsyncRayWork，与 worker 侧 recv 路径对齐。
+    dataproto_to_accel_for_channel_put(batch)
     ch.put(batch, weight=0, key=dp_rank, async_op=False)
 
 
@@ -34,12 +39,14 @@ def rollout_input_get(ch: Channel, dp_rank: int) -> DataProto:
     """Worker：读取本 DP rank 对应的 rollout 输入（``key=dp_rank``）。"""
     item = ch.get(key=dp_rank, async_op=False)
     assert isinstance(item, DataProto), f"Expected DataProto from rollout input channel, got {type(item)}"
+    dataproto_to_cpu_after_channel_get(item)
     return item
 
 
 def rollout_output_put(ch: Channel, output: DataProto, dp_rank: int) -> None:
     """Worker：将 rollout 输出写回与输入相同的 ``key=dp_rank``。"""
     # LocalChannel 仅支持同步 put；分布式 Channel 上可改为 async_op=True 并 await AsyncWork。
+    dataproto_to_accel_for_channel_put(output)
     ch.put(output, weight=0, key=dp_rank, async_op=False)
 
 
