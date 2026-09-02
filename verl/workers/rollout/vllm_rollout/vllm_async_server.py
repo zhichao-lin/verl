@@ -84,6 +84,25 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def kv_cfg_uses_mooncake_p2p(kv_cfg: Optional[dict]) -> bool:
+    """True when the PD kv_transfer_config uses MooncakeConnector for P2P.
+
+    Covers the plain MooncakeConnector payload and MultiConnector wrapping
+    MooncakeConnector + MooncakeStoreConnector. Mooncake P2P does not return
+    decode kv_transfer_params from the prefill leg, so dispatch must build
+    them locally.
+    """
+    if not kv_cfg:
+        return False
+    connector = kv_cfg.get("kv_connector", "")
+    if connector == "MooncakeConnector":
+        return True
+    if connector == "MultiConnector":
+        children = (kv_cfg.get("kv_connector_extra_config") or {}).get("connectors") or []
+        return any((child or {}).get("kv_connector") == "MooncakeConnector" for child in children)
+    return False
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -777,8 +796,7 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Run prefill locally, then decode on a selected peer."""
         decode_peer = self._select_decode_peer()
-        connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
-        is_mooncake = connector == "MooncakeConnector"
+        is_mooncake = kv_cfg_uses_mooncake_p2p(self._disaggregation_kv_transfer_config)
 
         # Prefill only materializes KV; discard its single generated token.
         prefill_sp = dict(sampling_params)

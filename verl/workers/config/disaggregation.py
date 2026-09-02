@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from verl.base_config import BaseConfig
@@ -20,6 +20,7 @@ __all__ = ["DisaggregationConfig"]
 
 _ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")
 _ALLOWED_MOONCAKE_PROTOCOLS = ("nvlink", "local", "rdma", "tcp")
+_STORE_TRANSFER_BACKENDS = ("nixl", "mooncake")
 
 
 @dataclass
@@ -34,6 +35,17 @@ class DisaggregationConfig(BaseConfig):
     bootstrap_port: Optional[int] = None
     ib_device: Optional[str] = None
     mooncake_protocol: str = "nvlink"
+    # Wrap the P2P connector with MooncakeStoreConnector via vLLM MultiConnector
+    # so PD engines share a Mooncake KV cache pool (prefix reuse / CPU offload).
+    enable_mooncake_store: bool = False
+    # Path forwarded as MOONCAKE_CONFIG_PATH into each PD vLLM actor.
+    # Falls back to the process env when null.
+    mooncake_store_config_path: Optional[str] = None
+    # Decoder-side MooncakeStoreConnector extra: append completed decode blocks.
+    save_decode_cache: bool = False
+    # Extra keys merged into the MooncakeStoreConnector kv_connector_extra_config
+    # (store_tp_size, load_async, cache_prefix, enable_store_tp_lcm, ...).
+    mooncake_store_extra_config: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -50,6 +62,11 @@ class DisaggregationConfig(BaseConfig):
         if self.transfer_backend == "mooncake" and self.mooncake_protocol not in _ALLOWED_MOONCAKE_PROTOCOLS:
             raise ValueError(
                 f"disaggregation.mooncake_protocol={self.mooncake_protocol!r} not in {_ALLOWED_MOONCAKE_PROTOCOLS}"
+            )
+        if self.enable_mooncake_store and self.transfer_backend not in _STORE_TRANSFER_BACKENDS:
+            raise ValueError(
+                f"disaggregation.enable_mooncake_store=True requires transfer_backend "
+                f"in {_STORE_TRANSFER_BACKENDS}; got {self.transfer_backend!r}"
             )
 
     def effective_decode_tp(self, prefill_tp: int) -> int:

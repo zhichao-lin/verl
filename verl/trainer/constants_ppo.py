@@ -147,6 +147,14 @@ def get_ppo_ray_runtime_env(config=None):
         "FLASH_ATTENTION_DETERMINISTIC",
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
+        # MooncakeStoreConnector reads the JSON config from this env var, not
+        # from kv_connector_extra_config. Forward so colocated and PD vLLM
+        # actors share the same master / pool.
+        "MOONCAKE_CONFIG_PATH",
+        "MOONCAKE_PREFERRED_SEGMENT",
+        "MOONCAKE_REQUESTER_LOCAL_HOSTNAME",
+        "VLLM_MOONCAKE_STORE_TIER_LOG",
+        "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO",
     ):
         val = os.environ.get(key)
         if val is not None:

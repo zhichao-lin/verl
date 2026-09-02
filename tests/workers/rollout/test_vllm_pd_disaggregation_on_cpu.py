@@ -185,6 +185,11 @@ def _build_kv_cfg(
     engine_id: str = "test-eid",
     transfer_backend: str = "nixl",
     mooncake_protocol=None,
+    enable_mooncake_store: bool = False,
+    mooncake_store_extra_config=None,
+    save_decode_cache: bool = False,
+    prefill_tp: int = 1,
+    decode_tp: int = 1,
 ):
     # Lazy import: only meaningful when vllm-rollout deps are importable.
     pytest.importorskip("vllm")
@@ -195,6 +200,11 @@ def _build_kv_cfg(
         engine_id=engine_id,
         transfer_backend=transfer_backend,
         mooncake_protocol=mooncake_protocol,
+        enable_mooncake_store=enable_mooncake_store,
+        mooncake_store_extra_config=mooncake_store_extra_config,
+        save_decode_cache=save_decode_cache,
+        prefill_tp=prefill_tp,
+        decode_tp=decode_tp,
     )
 
 
@@ -264,6 +274,123 @@ def test_disagg_config_default_mooncake_protocol_is_nvlink():
     assert DisaggregationConfig().mooncake_protocol == "nvlink"
 
 
+def test_disagg_config_mooncake_store_defaults_off():
+    cfg = DisaggregationConfig()
+    assert cfg.enable_mooncake_store is False
+    assert cfg.mooncake_store_config_path is None
+    assert cfg.save_decode_cache is False
+    assert cfg.mooncake_store_extra_config == {}
+
+
+def test_disagg_config_enable_mooncake_store_with_mooncake_ok():
+    cfg = DisaggregationConfig(enabled=True, transfer_backend="mooncake", enable_mooncake_store=True)
+    assert cfg.enable_mooncake_store is True
+
+
+def test_disagg_config_enable_mooncake_store_with_nixl_ok():
+    cfg = DisaggregationConfig(enabled=True, transfer_backend="nixl", enable_mooncake_store=True)
+    assert cfg.enable_mooncake_store is True
+
+
+@pytest.mark.parametrize("backend", ["ascend", "mori", "fake"])
+def test_disagg_config_enable_mooncake_store_rejects_unsupported_backend(backend):
+    with pytest.raises(ValueError, match="enable_mooncake_store"):
+        DisaggregationConfig(enabled=True, transfer_backend=backend, enable_mooncake_store=True)
+
+
+def test_build_kv_transfer_config_mooncake_store_wraps_multi_connector():
+    """PD + Mooncake store uses vLLM MultiConnector: P2P MooncakeConnector plus
+    MooncakeStoreConnector (shared KV pool), matching the upstream XpYd recipe."""
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        mooncake_protocol="nvlink",
+        enable_mooncake_store=True,
+    )
+    assert cfg["kv_connector"] == "MultiConnector"
+    assert cfg["kv_role"] == "kv_producer"
+    children = cfg["kv_connector_extra_config"]["connectors"]
+    assert [c["kv_connector"] for c in children] == ["MooncakeConnector", "MooncakeStoreConnector"]
+    assert children[0]["kv_role"] == "kv_producer"
+    assert children[0]["kv_connector_extra_config"] == {"mooncake_protocol": "nvlink"}
+    assert children[1]["kv_role"] == "kv_both"
+    assert "kv_connector_extra_config" not in children[1]
+
+
+def test_build_kv_transfer_config_mooncake_store_decode_is_consumer():
+    cfg = _build_kv_cfg(role="decode", transfer_backend="mooncake", enable_mooncake_store=True)
+    children = cfg["kv_connector_extra_config"]["connectors"]
+    assert children[0]["kv_role"] == "kv_consumer"
+    assert children[1]["kv_connector"] == "MooncakeStoreConnector"
+    assert children[1]["kv_role"] == "kv_consumer"
+    assert "save_decode_cache" not in children[1].get("kv_connector_extra_config", {})
+
+
+def test_build_kv_transfer_config_save_decode_cache_only_on_decode_store():
+    prefill = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        save_decode_cache=True,
+    )
+    decode = _build_kv_cfg(
+        role="decode",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        save_decode_cache=True,
+    )
+    prefill_store = prefill["kv_connector_extra_config"]["connectors"][1]
+    decode_store = decode["kv_connector_extra_config"]["connectors"][1]
+    assert "save_decode_cache" not in prefill_store.get("kv_connector_extra_config", {})
+    assert decode_store["kv_connector_extra_config"]["save_decode_cache"] is True
+
+
+def test_build_kv_transfer_config_nixl_plus_store_uses_multi_connector():
+    cfg = _build_kv_cfg(role="prefill", transfer_backend="nixl", enable_mooncake_store=True)
+    assert cfg["kv_connector"] == "MultiConnector"
+    children = cfg["kv_connector_extra_config"]["connectors"]
+    assert [c["kv_connector"] for c in children] == ["NixlConnector", "MooncakeStoreConnector"]
+
+
+def test_build_kv_transfer_config_store_tp_size_when_pd_tp_differs():
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    store = cfg["kv_connector_extra_config"]["connectors"][1]
+    assert store["kv_connector_extra_config"]["store_tp_size"] == 4
+
+
+def test_build_kv_transfer_config_store_tp_lcm_when_tps_not_divisible():
+    cfg = _build_kv_cfg(
+        role="decode",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        prefill_tp=4,
+        decode_tp=3,
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["enable_store_tp_lcm"] is True
+    assert extra["prefill_tp_sizes"] == [4, 3]
+
+
+def test_build_kv_transfer_config_user_store_tp_size_not_overwritten():
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        mooncake_store_extra_config={"store_tp_size": 8},
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["store_tp_size"] == 8
+    assert "enable_store_tp_lcm" not in extra
+
+
 # ---------------------------------------------------------------------------
 # vLLMPDReplica.__init__ validation paths
 #
@@ -281,6 +408,10 @@ def _make_pd_config(**overrides) -> RolloutConfig:
         transfer_backend=overrides.pop("transfer_backend", "nixl"),
         decode_tensor_model_parallel_size=overrides.pop("decode_tensor_model_parallel_size", None),
         ib_device=overrides.pop("ib_device", None),
+        enable_mooncake_store=overrides.pop("enable_mooncake_store", False),
+        mooncake_store_config_path=overrides.pop("mooncake_store_config_path", None),
+        save_decode_cache=overrides.pop("save_decode_cache", False),
+        mooncake_store_extra_config=overrides.pop("mooncake_store_extra_config", {}),
     )
     return RolloutConfig(
         name="vllm",
@@ -375,6 +506,47 @@ def test_pd_replica_init_accepts_mooncake(patched_replica_cls):
     assert replica.config.disaggregation.transfer_backend == "mooncake"
 
 
+def test_resolve_mooncake_store_from_disagg_flag(patched_replica_cls):
+    cfg = _make_pd_config(
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        mooncake_store_config_path="/tmp/mooncake.json",
+        mooncake_store_extra_config={"load_async": False},
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    enable, extra, path = replica._resolve_mooncake_store_settings()
+    assert enable is True
+    assert extra == {"load_async": False}
+    assert path == "/tmp/mooncake.json"
+
+
+def test_resolve_mooncake_store_from_engine_kwargs(patched_replica_cls):
+    """Colocated offload yaml (engine_kwargs MooncakeStoreConnector) still
+    enables the store under PD; extras are harvested because PD overwrites
+    the top-level kv_transfer_config."""
+    cfg = _make_pd_config(
+        transfer_backend="mooncake",
+        engine_kwargs={
+            "vllm": {
+                "kv_transfer_config": {
+                    "kv_connector": "MooncakeStoreConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {
+                        "load_async": True,
+                        "mooncake_config_path": "/tmp/from_engine.json",
+                    },
+                }
+            }
+        },
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    enable, extra, path = replica._resolve_mooncake_store_settings()
+    assert enable is True
+    assert extra["load_async"] is True
+    assert "mooncake_config_path" not in extra
+    assert path == "/tmp/from_engine.json"
+
+
 def test_pd_replica_init_rejects_unsupported_backend(patched_replica_cls):
     cfg = _make_pd_config(transfer_backend="mori")
     with pytest.raises(NotImplementedError, match="transfer_backend in"):
@@ -406,6 +578,36 @@ def test_pd_replica_init_requires_disaggregation_enabled(patched_replica_cls):
     # without disagg.enabled is invalid — class-level assertion guards.
     with pytest.raises(AssertionError, match="disaggregation.enabled=True"):
         patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+
+
+def test_kv_cfg_uses_mooncake_p2p_plain_and_multi():
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import kv_cfg_uses_mooncake_p2p
+
+    assert kv_cfg_uses_mooncake_p2p({"kv_connector": "MooncakeConnector"}) is True
+    assert kv_cfg_uses_mooncake_p2p({"kv_connector": "NixlConnector"}) is False
+    assert kv_cfg_uses_mooncake_p2p(
+        {
+            "kv_connector": "MultiConnector",
+            "kv_connector_extra_config": {
+                "connectors": [
+                    {"kv_connector": "MooncakeConnector"},
+                    {"kv_connector": "MooncakeStoreConnector"},
+                ]
+            },
+        }
+    ) is True
+    assert kv_cfg_uses_mooncake_p2p(
+        {
+            "kv_connector": "MultiConnector",
+            "kv_connector_extra_config": {
+                "connectors": [
+                    {"kv_connector": "NixlConnector"},
+                    {"kv_connector": "MooncakeStoreConnector"},
+                ]
+            },
+        }
+    ) is False
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +796,50 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     assert dkv["remote_bootstrap_addr"] == f"http://127.0.0.1:{stub._pd_prefill_side_channel_port}"
     # transfer_id must match across legs so prefill and decode rendezvous.
     assert dkv["transfer_id"] == transfer_id
+
+
+@pytest.mark.asyncio
+async def test_pd_dispatch_multi_connector_mooncake_constructs_decode_kv_params():
+    """MultiConnector wrapping MooncakeConnector must take the same local
+    decode-params path: Mooncake P2P still returns no kv_transfer_params."""
+    from unittest.mock import MagicMock
+
+    server_cls = _import_http_server()
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import kv_cfg_uses_mooncake_p2p
+
+    multi_cfg = {
+        "kv_connector": "MultiConnector",
+        "kv_connector_extra_config": {
+            "connectors": [
+                {"kv_connector": "MooncakeConnector", "kv_role": "kv_producer"},
+                {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_both"},
+            ]
+        },
+    }
+    assert kv_cfg_uses_mooncake_p2p(multi_cfg) is True
+
+    decode_peer = MagicMock()
+    decode_peer.generate.remote = MagicMock(return_value=_make_awaitable_token_output([7]))
+
+    async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        from verl.workers.rollout.replica import TokenOutput
+
+        return TokenOutput(token_ids=[42], stop_reason="completed", extra_fields={})
+
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MultiConnector")
+    stub._disaggregation_kv_transfer_config = multi_cfg
+    stub.generate = fake_generate
+
+    await server_cls._pd_dispatch(
+        stub,
+        prompt_ids=[1, 2],
+        sampling_params={"max_tokens": 16},
+        request_id="req-mc-store",
+    )
+
+    dkv = decode_peer.generate.remote.call_args.kwargs["kv_transfer_params"]
+    assert dkv["remote_engine_id"] == stub._pd_prefill_engine_id
+    assert dkv["do_remote_prefill"] is True
 
 
 @pytest.mark.asyncio

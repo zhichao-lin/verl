@@ -1,6 +1,6 @@
 # Rollout KV Cache Offload via Mooncake-Store
 
-Last updated: 05/27/2026.
+Last updated: 09/02/2026.
 
 Offload prefix KV blocks from the vLLM rollout engine to a shared
 [Mooncake](https://github.com/kvcache-ai/Mooncake) store so long shared
@@ -16,11 +16,23 @@ master, and writing the JSON config:
 **<https://docs.vllm.ai/en/latest/features/mooncake_store_connector_usage/>**
 
 The verl side only consumes whatever that doc produces — no extra steps.
+MooncakeStoreConnector reads the JSON file from the `MOONCAKE_CONFIG_PATH`
+environment variable (not from `kv_connector_extra_config`).
 
-## Enable in verl
+Start the master before training:
+
+```bash
+mooncake_master --port 50051
+export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
+```
+
+verl forwards `MOONCAKE_CONFIG_PATH` into Ray actors automatically when it is
+set in the launch shell.
+
+## Enable in colocated vLLM rollout
 
 verl forwards `engine_kwargs.vllm.*` straight to `vllm serve` as CLI flags.
-To attach the Mooncake connector, set `kv_transfer_config`:
+To attach the Mooncake store connector, set `kv_transfer_config`:
 
 ```yaml
 actor_rollout_ref:
@@ -30,10 +42,7 @@ actor_rollout_ref:
         kv_transfer_config: |-
           {
             "kv_connector": "MooncakeStoreConnector",
-            "kv_role": "kv_both",
-            "kv_connector_extra_config": {
-              "mooncake_config_path": "/path/to/mooncake_config.json"
-            }
+            "kv_role": "kv_both"
           }
 ```
 
@@ -41,9 +50,46 @@ Or as a Hydra CLI override:
 
 ```bash
 +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_connector=MooncakeStoreConnector \
-+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_role=kv_both \
-+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_connector_extra_config.mooncake_config_path=/path/to/mooncake_config.json
++actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_role=kv_both
 ```
+
+## Enable in vLLM Prefill-Decode disaggregation
+
+PD launch overwrites `engine_kwargs.vllm.kv_transfer_config` with the P2P
+connector (`NixlConnector` / `MooncakeConnector`). To also attach the shared
+KV pool, wrap both connectors in vLLM `MultiConnector` via:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    name: vllm
+    disaggregation:
+      enabled: True
+      transfer_backend: mooncake   # or nixl
+      mooncake_protocol: nvlink
+      enable_mooncake_store: True
+      mooncake_store_config_path: /path/to/mooncake_config.json
+      save_decode_cache: False     # True: decoder also writes completed decode KV
+      mooncake_store_extra_config: {}
+```
+
+Equivalent CLI:
+
+```bash
+actor_rollout_ref.rollout.disaggregation.enabled=True \
+actor_rollout_ref.rollout.disaggregation.transfer_backend=mooncake \
+actor_rollout_ref.rollout.disaggregation.enable_mooncake_store=True \
+actor_rollout_ref.rollout.disaggregation.mooncake_store_config_path=/path/to/mooncake_config.json
+```
+
+Prefiller is launched as `kv_producer` + `MooncakeStoreConnector(kv_both)`;
+decoder as `kv_consumer` + `MooncakeStoreConnector(kv_consumer)`. When
+prefill TP and decode TP differ, verl sets `store_tp_size` (or
+`enable_store_tp_lcm`) on the store connector automatically.
+
+The colocated `engine_kwargs.vllm.kv_transfer_config=MooncakeStoreConnector`
+recipe also opts PD into the store: extras are harvested, then composed into
+`MultiConnector` so P2P transfer is not dropped.
 
 ## RL correctness: hard reset on every weight update
 

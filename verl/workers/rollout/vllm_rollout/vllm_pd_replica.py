@@ -15,11 +15,12 @@
 asymmetric TP supported. MVP: prefill_replicas=1, single-node only."""
 
 import asyncio
+import json
 import logging
 import os
 import uuid
 from dataclasses import replace as _dc_replace
-from typing import Optional
+from typing import Any, Optional
 
 import ray
 from ray.actor import ActorHandle
@@ -31,6 +32,56 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _plain_mapping(value: Any) -> dict:
+    """Coerce OmegaConf / dict extras into a plain dict."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        from omegaconf import OmegaConf
+
+        return dict(OmegaConf.to_container(value, resolve=True) or {})
+    except Exception:
+        return dict(value)
+
+
+def _engine_kwargs_kv_transfer_config(config) -> Optional[dict]:
+    """Read optional colocated ``engine_kwargs.vllm.kv_transfer_config``."""
+    engine_kwargs = (config.get("engine_kwargs") or {}).get("vllm") or {}
+    user_kv = engine_kwargs.get("kv_transfer_config") if hasattr(engine_kwargs, "get") else None
+    if user_kv is None:
+        return None
+    if isinstance(user_kv, str):
+        try:
+            user_kv = json.loads(user_kv)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(user_kv, dict):
+        try:
+            from omegaconf import OmegaConf
+
+            user_kv = OmegaConf.to_container(user_kv, resolve=True)
+        except Exception:
+            return None
+    return user_kv if isinstance(user_kv, dict) else None
+
+
+def _with_store_tp_size(extra: dict, prefill_tp: int, decode_tp: int) -> dict:
+    """Fill store_tp_size / LCM extras when prefill and decode TP differ."""
+    if extra.get("store_tp_size") or extra.get("enable_store_tp_lcm"):
+        return extra
+    if prefill_tp == decode_tp:
+        return extra
+    bigger, smaller = max(prefill_tp, decode_tp), min(prefill_tp, decode_tp)
+    if bigger % smaller == 0:
+        extra["store_tp_size"] = bigger
+    else:
+        extra["enable_store_tp_lcm"] = True
+        extra["prefill_tp_sizes"] = [prefill_tp, decode_tp]
+    return extra
 
 
 class vLLMPDReplica(vLLMReplica):
@@ -134,11 +185,22 @@ class vLLMPDReplica(vLLMReplica):
         prefill_side_channel_port, prefill_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
         reserved_socks.append(prefill_sock)
         try:
+            store_enabled, store_extra, store_config_path = self._resolve_mooncake_store_settings()
+            if store_enabled and not store_config_path:
+                raise ValueError(
+                    "disaggregation.enable_mooncake_store=True requires "
+                    "disaggregation.mooncake_store_config_path or MOONCAKE_CONFIG_PATH"
+                )
             prefill_kv_cfg = self._build_kv_transfer_config(
                 role="prefill",
                 engine_id=prefill_engine_id,
                 transfer_backend=self.config.disaggregation.transfer_backend,
                 mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+                enable_mooncake_store=store_enabled,
+                mooncake_store_extra_config=store_extra,
+                save_decode_cache=self.config.disaggregation.save_decode_cache,
+                prefill_tp=self._prefill_tp,
+                decode_tp=self._decode_tp,
             )
             self._prefill_servers = [
                 self._spawn_pd_server(
@@ -151,6 +213,7 @@ class vLLMPDReplica(vLLMReplica):
                     side_channel_host=prefill_host_ip,
                     side_channel_port=prefill_side_channel_port,
                     mooncake_bootstrap_port=prefill_side_channel_port,
+                    mooncake_store_config_path=store_config_path,
                     actor_name=f"vllm_server_{self.replica_rank}_0{self.name_suffix}",
                     zmq_base_trainer_rank=0,
                 )
@@ -170,6 +233,11 @@ class vLLMPDReplica(vLLMReplica):
                     engine_id=uuid.uuid4().hex,
                     transfer_backend=self.config.disaggregation.transfer_backend,
                     mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+                    enable_mooncake_store=store_enabled,
+                    mooncake_store_extra_config=store_extra,
+                    save_decode_cache=self.config.disaggregation.save_decode_cache,
+                    prefill_tp=self._prefill_tp,
+                    decode_tp=self._decode_tp,
                 )
                 self._decode_servers.append(
                     self._spawn_pd_server(
@@ -182,6 +250,7 @@ class vLLMPDReplica(vLLMReplica):
                         side_channel_host=prefill_host_ip,
                         side_channel_port=decode_side_channel_port,
                         mooncake_bootstrap_port=prefill_side_channel_port,
+                        mooncake_store_config_path=store_config_path,
                         actor_name=f"vllm_server_decode_{self.replica_rank}_{i}{self.name_suffix}",
                         zmq_base_trainer_rank=start,
                     )
@@ -226,31 +295,96 @@ class vLLMPDReplica(vLLMReplica):
     def _collect_cuda_devices(worker_infos) -> str:
         return ",".join(worker_info[1] for worker_info in worker_infos)
 
+    def _resolve_mooncake_store_settings(self) -> tuple[bool, dict, Optional[str]]:
+        """Resolve whether to attach MooncakeStoreConnector and its extras.
+
+        Store can be opted in via ``disaggregation.enable_mooncake_store`` or by
+        putting ``MooncakeStoreConnector`` in ``engine_kwargs.vllm.kv_transfer_config``
+        (the colocated offload recipe). PD always overwrites the top-level
+        ``kv_transfer_config`` with a composed MultiConnector, so we harvest
+        extras from engine_kwargs instead of forwarding it verbatim.
+        """
+        disagg = self.config.disaggregation
+        enable = bool(disagg.enable_mooncake_store)
+        extra = _plain_mapping(disagg.mooncake_store_extra_config)
+        path = disagg.mooncake_store_config_path or os.environ.get("MOONCAKE_CONFIG_PATH")
+
+        user_kv = _engine_kwargs_kv_transfer_config(self.config)
+        if isinstance(user_kv, dict) and user_kv.get("kv_connector") == "MooncakeStoreConnector":
+            enable = True
+            extra = {**_plain_mapping(user_kv.get("kv_connector_extra_config")), **extra}
+            path = extra.pop("mooncake_config_path", None) or path
+
+        return enable, extra, path
+
     @staticmethod
     def _build_kv_transfer_config(
         role: str,
         engine_id: str,
         transfer_backend: str,
         mooncake_protocol: Optional[str] = None,
+        enable_mooncake_store: bool = False,
+        mooncake_store_extra_config: Optional[dict] = None,
+        save_decode_cache: bool = False,
+        prefill_tp: int = 1,
+        decode_tp: int = 1,
     ) -> dict:
-        """Assemble vLLM's ``--kv-transfer-config`` payload."""
+        """Assemble vLLM's ``--kv-transfer-config`` payload.
+
+        When ``enable_mooncake_store`` is set, wrap the P2P connector and
+        ``MooncakeStoreConnector`` in ``MultiConnector`` (vLLM XpYd recipe).
+        """
         role_to_kv_role = {
             "prefill": "kv_producer",
             "decode": "kv_consumer",
         }
-        connector = {
+        p2p_connector = {
             "nixl": "NixlConnector",
             "mooncake": "MooncakeConnector",
         }[transfer_backend]
-        cfg: dict = {
-            "kv_connector": connector,
-            "kv_role": role_to_kv_role[role],
-            "engine_id": engine_id,
-            "kv_buffer_device": get_device_name(),
+        kv_role = role_to_kv_role[role]
+        p2p_cfg: dict[str, Any] = {
+            "kv_connector": p2p_connector,
+            "kv_role": kv_role,
         }
         if transfer_backend == "mooncake" and mooncake_protocol:
-            cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
-        return cfg
+            p2p_cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
+
+        if not enable_mooncake_store:
+            cfg = {
+                "kv_connector": p2p_connector,
+                "kv_role": kv_role,
+                "engine_id": engine_id,
+                "kv_buffer_device": get_device_name(),
+            }
+            extra = p2p_cfg.get("kv_connector_extra_config")
+            if extra:
+                cfg["kv_connector_extra_config"] = extra
+            return cfg
+
+        store_extra = _with_store_tp_size(
+            dict(mooncake_store_extra_config or {}),
+            prefill_tp=prefill_tp,
+            decode_tp=decode_tp,
+        )
+        if role == "decode" and save_decode_cache:
+            store_extra["save_decode_cache"] = True
+        store_cfg: dict[str, Any] = {
+            "kv_connector": "MooncakeStoreConnector",
+            # Prefiller both writes prefix KV and can hit existing entries.
+            # Decoder loads from the pool; optional save_decode_cache appends.
+            "kv_role": "kv_both" if role == "prefill" else "kv_consumer",
+        }
+        if store_extra:
+            store_cfg["kv_connector_extra_config"] = store_extra
+
+        return {
+            "kv_connector": "MultiConnector",
+            "kv_role": kv_role,
+            "engine_id": engine_id,
+            "kv_buffer_device": get_device_name(),
+            "kv_connector_extra_config": {"connectors": [p2p_cfg, store_cfg]},
+        }
 
     def _spawn_pd_server(
         self,
@@ -265,6 +399,7 @@ class vLLMPDReplica(vLLMReplica):
         mooncake_bootstrap_port: int,
         actor_name: str,
         zmq_base_trainer_rank: int = 0,
+        mooncake_store_config_path: Optional[str] = None,
     ) -> ActorHandle:
         """Construct one PD ``vLLMHttpServer`` actor."""
         per_role_config = _dc_replace(self.config, tensor_model_parallel_size=tp)
@@ -281,6 +416,8 @@ class vLLMPDReplica(vLLMReplica):
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
             "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
         }
+        if mooncake_store_config_path:
+            env_vars["MOONCAKE_CONFIG_PATH"] = mooncake_store_config_path
 
         return self.server_class.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
