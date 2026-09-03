@@ -56,8 +56,8 @@ Or as a Hydra CLI override:
 ## Enable in vLLM Prefill-Decode disaggregation
 
 PD launch overwrites `engine_kwargs.vllm.kv_transfer_config` with the P2P
-connector (`NixlConnector` / `MooncakeConnector`). To also attach the shared
-KV pool, wrap both connectors in vLLM `MultiConnector` via:
+connector. To also attach the shared KV pool, wrap both connectors in vLLM
+`MultiConnector` via:
 
 ```yaml
 actor_rollout_ref:
@@ -65,8 +65,8 @@ actor_rollout_ref:
     name: vllm
     disaggregation:
       enabled: True
-      transfer_backend: mooncake   # or nixl
-      mooncake_protocol: nvlink
+      transfer_backend: mooncake   # GPU: nixl | mooncake; NPU: mooncake | ascend
+      mooncake_protocol: nvlink    # GPU MooncakeConnector only
       enable_mooncake_store: True
       mooncake_store_config_path: /path/to/mooncake_config.json
       save_decode_cache: False     # True: decoder also writes completed decode KV
@@ -82,14 +82,24 @@ actor_rollout_ref.rollout.disaggregation.enable_mooncake_store=True \
 actor_rollout_ref.rollout.disaggregation.mooncake_store_config_path=/path/to/mooncake_config.json
 ```
 
-Prefiller is launched as `kv_producer` + `MooncakeStoreConnector(kv_both)`;
+**GPU.** Prefiller is launched as `kv_producer` + `MooncakeStoreConnector(kv_both)`;
 decoder as `kv_consumer` + `MooncakeStoreConnector(kv_consumer)`. When
 prefill TP and decode TP differ, verl sets `store_tp_size` (or
 `enable_store_tp_lcm`) on the store connector automatically.
 
-The colocated `engine_kwargs.vllm.kv_transfer_config=MooncakeStoreConnector`
-recipe also opts PD into the store: extras are harvested, then composed into
-`MultiConnector` so P2P transfer is not dropped.
+**NPU (vLLM-Ascend).** Prefiller/decoder use `MooncakeConnectorV1` plus
+`AscendStoreConnector(backend=mooncake)`. The Mooncake JSON `protocol` must
+be `"ascend"` (install `mooncake-transfer-engine-npu`). Heterogeneous TP does
+not auto-fill GPU `store_tp_size`; `save_decode_cache=True` maps to decode
+`consumer_is_to_put`. Prefill lookup RPC port is `"0"`; decode uses its
+side-channel port. `MooncakeConnectorV1.request_finished` returns
+`kv_transfer_params` (Nixl-like), so dispatch must **not** take the GPU
+Mooncake local-bootstrap path.
+
+The colocated `engine_kwargs.vllm.kv_transfer_config` recipe
+(`MooncakeStoreConnector` / `AscendStoreConnector` /
+`MooncakeConnectorStoreV1`) also opts PD into the store: extras are
+harvested, then composed into `MultiConnector` so P2P transfer is not dropped.
 
 ## RL correctness: hard reset on every weight update
 

@@ -25,13 +25,38 @@ from typing import Any, Optional
 import ray
 from ray.actor import ActorHandle
 
-from verl.utils.device import get_device_name, get_resource_name, is_torch_npu_available
+from verl.utils.device import get_device_name, get_resource_name
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+_PD_TRANSFER_BACKENDS = ("nixl", "mooncake", "ascend")
+_NPU_PD_TRANSFER_BACKENDS = ("mooncake", "ascend")
+_STORE_KV_CONNECTORS = frozenset(
+    {
+        "MooncakeStoreConnector",
+        "AscendStoreConnector",
+        "MooncakeConnectorStoreV1",
+    }
+)
+
+
+def _validate_npu_pd_backend(device_name: str, transfer_backend: str) -> None:
+    """NPU PD is MooncakeConnectorV1 / AscendStore only; Nixl is GPU-side."""
+    if device_name != "npu":
+        return
+    if transfer_backend not in _NPU_PD_TRANSFER_BACKENDS:
+        raise NotImplementedError(
+            f"vLLM PD on NPU requires transfer_backend in {_NPU_PD_TRANSFER_BACKENDS}; "
+            f"got {transfer_backend!r}"
+        )
+
+
+def _use_ascend_kv_connectors(device_name: str, transfer_backend: str) -> bool:
+    return transfer_backend == "ascend" or (device_name == "npu" and transfer_backend == "mooncake")
 
 
 def _plain_mapping(value: Any) -> dict:
@@ -112,10 +137,10 @@ class vLLMPDReplica(vLLMReplica):
         disagg = self.config.disaggregation
         assert disagg.enabled, "vLLMPDReplica requires rollout.disaggregation.enabled=True"
 
-        if disagg.transfer_backend not in ("nixl", "mooncake"):
+        if disagg.transfer_backend not in _PD_TRANSFER_BACKENDS:
             raise NotImplementedError(
-                f"vLLMPDReplica supports transfer_backend in ('nixl', 'mooncake') in this "
-                f"revision; got {disagg.transfer_backend!r}. mori/ascend/fake are reserved "
+                f"vLLMPDReplica supports transfer_backend in {_PD_TRANSFER_BACKENDS} in this "
+                f"revision; got {disagg.transfer_backend!r}. mori/fake are reserved "
                 f"in DisaggregationConfig and will land in follow-ups."
             )
         if disagg.prefill_replicas != 1:
@@ -158,7 +183,10 @@ class vLLMPDReplica(vLLMReplica):
         assert len(self.workers) == self.world_size, (
             f"worker count {len(self.workers)} != PD world size {self.world_size}"
         )
-        assert not is_torch_npu_available(check_device=False), "vLLM PD on NPU not validated"
+        device_name = get_device_name()
+        transfer_backend = self.config.disaggregation.transfer_backend
+        _validate_npu_pd_backend(device_name, transfer_backend)
+        npu_kv = _use_ascend_kv_connectors(device_name, transfer_backend)
 
         worker_infos = await asyncio.gather(
             *[
@@ -196,13 +224,16 @@ class vLLMPDReplica(vLLMReplica):
             prefill_kv_cfg = self._build_kv_transfer_config(
                 role="prefill",
                 engine_id=prefill_engine_id,
-                transfer_backend=self.config.disaggregation.transfer_backend,
+                transfer_backend=transfer_backend,
                 mooncake_protocol=self.config.disaggregation.mooncake_protocol,
                 enable_mooncake_store=store_enabled,
                 mooncake_store_extra_config=store_extra,
                 save_decode_cache=self.config.disaggregation.save_decode_cache,
                 prefill_tp=self._prefill_tp,
                 decode_tp=self._decode_tp,
+                device_name=device_name,
+                kv_port=prefill_side_channel_port if npu_kv else None,
+                lookup_rpc_port=0 if npu_kv else None,
             )
             self._prefill_servers = [
                 self._spawn_pd_server(
@@ -233,13 +264,16 @@ class vLLMPDReplica(vLLMReplica):
                 decode_kv_cfg = self._build_kv_transfer_config(
                     role="decode",
                     engine_id=uuid.uuid4().hex,
-                    transfer_backend=self.config.disaggregation.transfer_backend,
+                    transfer_backend=transfer_backend,
                     mooncake_protocol=self.config.disaggregation.mooncake_protocol,
                     enable_mooncake_store=store_enabled,
                     mooncake_store_extra_config=store_extra,
                     save_decode_cache=self.config.disaggregation.save_decode_cache,
                     prefill_tp=self._prefill_tp,
                     decode_tp=self._decode_tp,
+                    device_name=device_name,
+                    kv_port=decode_side_channel_port if npu_kv else None,
+                    lookup_rpc_port=decode_side_channel_port if npu_kv else None,
                 )
                 self._decode_servers.append(
                     self._spawn_pd_server(
@@ -298,10 +332,11 @@ class vLLMPDReplica(vLLMReplica):
         return ",".join(worker_info[1] for worker_info in worker_infos)
 
     def _resolve_mooncake_store_settings(self) -> tuple[bool, dict, Optional[str]]:
-        """Resolve whether to attach MooncakeStoreConnector and its extras.
+        """Resolve whether to attach a Mooncake / Ascend store connector and extras.
 
         Store can be opted in via ``disaggregation.enable_mooncake_store`` or by
-        putting ``MooncakeStoreConnector`` in ``engine_kwargs.vllm.kv_transfer_config``
+        putting ``MooncakeStoreConnector`` / ``AscendStoreConnector`` /
+        ``MooncakeConnectorStoreV1`` in ``engine_kwargs.vllm.kv_transfer_config``
         (the colocated offload recipe). PD always overwrites the top-level
         ``kv_transfer_config`` with a composed MultiConnector, so we harvest
         extras from engine_kwargs instead of forwarding it verbatim.
@@ -312,7 +347,7 @@ class vLLMPDReplica(vLLMReplica):
         path = disagg.mooncake_store_config_path or os.environ.get("MOONCAKE_CONFIG_PATH")
 
         user_kv = _engine_kwargs_kv_transfer_config(self.config)
-        if isinstance(user_kv, dict) and user_kv.get("kv_connector") == "MooncakeStoreConnector":
+        if isinstance(user_kv, dict) and user_kv.get("kv_connector") in _STORE_KV_CONNECTORS:
             enable = True
             extra = {**_plain_mapping(user_kv.get("kv_connector_extra_config")), **extra}
             path = extra.pop("mooncake_config_path", None) or path
@@ -330,63 +365,102 @@ class vLLMPDReplica(vLLMReplica):
         save_decode_cache: bool = False,
         prefill_tp: int = 1,
         decode_tp: int = 1,
+        device_name: Optional[str] = None,
+        kv_port: Optional[int] = None,
+        lookup_rpc_port: Optional[int] = None,
     ) -> dict:
         """Assemble vLLM's ``--kv-transfer-config`` payload.
 
-        When ``enable_mooncake_store`` is set, wrap the P2P connector and
-        ``MooncakeStoreConnector`` in ``MultiConnector`` (vLLM XpYd recipe).
+        GPU: P2P ``MooncakeConnector`` / ``NixlConnector``, optional
+        ``MooncakeStoreConnector`` under ``MultiConnector``.
+
+        NPU (or ``transfer_backend=ascend``): P2P ``MooncakeConnectorV1`` plus
+        ``AscendStoreConnector(backend=mooncake)``. Do not auto-fill GPU
+        ``store_tp_size`` extras; map ``save_decode_cache`` to
+        ``consumer_is_to_put`` on the decode store.
         """
+        if device_name is None:
+            device_name = get_device_name()
+        use_ascend = _use_ascend_kv_connectors(device_name, transfer_backend)
+
         role_to_kv_role = {
             "prefill": "kv_producer",
             "decode": "kv_consumer",
         }
-        p2p_connector = {
-            "nixl": "NixlConnector",
-            "mooncake": "MooncakeConnector",
-        }[transfer_backend]
         kv_role = role_to_kv_role[role]
+        if use_ascend:
+            p2p_connector = "MooncakeConnectorV1"
+        else:
+            p2p_connector = {
+                "nixl": "NixlConnector",
+                "mooncake": "MooncakeConnector",
+            }[transfer_backend]
+
         p2p_cfg: dict[str, Any] = {
             "kv_connector": p2p_connector,
             "kv_role": kv_role,
         }
-        if transfer_backend == "mooncake" and mooncake_protocol:
+        if kv_port is not None:
+            p2p_cfg["kv_port"] = kv_port
+        if use_ascend:
+            p2p_cfg["kv_buffer_device"] = device_name
+            p2p_cfg["kv_connector_extra_config"] = {
+                "prefill": {"dp_size": 1, "tp_size": prefill_tp},
+                "decode": {"dp_size": 1, "tp_size": decode_tp},
+            }
+        elif transfer_backend == "mooncake" and mooncake_protocol:
             p2p_cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
+
+        def _with_optional_kv_port(cfg: dict) -> dict:
+            if kv_port is not None:
+                cfg["kv_port"] = kv_port
+            return cfg
 
         if not enable_mooncake_store:
             cfg = {
                 "kv_connector": p2p_connector,
                 "kv_role": kv_role,
                 "engine_id": engine_id,
-                "kv_buffer_device": get_device_name(),
+                "kv_buffer_device": device_name,
             }
             extra = p2p_cfg.get("kv_connector_extra_config")
             if extra:
                 cfg["kv_connector_extra_config"] = extra
-            return cfg
+            return _with_optional_kv_port(cfg)
 
-        store_extra = _with_store_tp_size(
-            dict(mooncake_store_extra_config or {}),
-            prefill_tp=prefill_tp,
-            decode_tp=decode_tp,
-        )
-        if role == "decode" and save_decode_cache:
-            store_extra["save_decode_cache"] = True
-        store_cfg: dict[str, Any] = {
-            "kv_connector": "MooncakeStoreConnector",
-            # Prefiller both writes prefix KV and can hit existing entries.
-            # Decoder loads from the pool; optional save_decode_cache appends.
-            "kv_role": "kv_both" if role == "prefill" else "kv_consumer",
-        }
+        store_extra = dict(mooncake_store_extra_config or {})
+        if use_ascend:
+            store_extra.setdefault("backend", "mooncake")
+            if lookup_rpc_port is not None:
+                store_extra["lookup_rpc_port"] = str(lookup_rpc_port)
+            if role == "decode" and save_decode_cache:
+                store_extra["consumer_is_to_put"] = True
+            store_cfg = {
+                "kv_connector": "AscendStoreConnector",
+                "kv_role": kv_role,
+            }
+        else:
+            store_extra = _with_store_tp_size(store_extra, prefill_tp=prefill_tp, decode_tp=decode_tp)
+            if role == "decode" and save_decode_cache:
+                store_extra["save_decode_cache"] = True
+            store_cfg = {
+                "kv_connector": "MooncakeStoreConnector",
+                # Prefiller both writes prefix KV and can hit existing entries.
+                # Decoder loads from the pool; optional save_decode_cache appends.
+                "kv_role": "kv_both" if role == "prefill" else "kv_consumer",
+            }
         if store_extra:
             store_cfg["kv_connector_extra_config"] = store_extra
 
-        return {
-            "kv_connector": "MultiConnector",
-            "kv_role": kv_role,
-            "engine_id": engine_id,
-            "kv_buffer_device": get_device_name(),
-            "kv_connector_extra_config": {"connectors": [p2p_cfg, store_cfg]},
-        }
+        return _with_optional_kv_port(
+            {
+                "kv_connector": "MultiConnector",
+                "kv_role": kv_role,
+                "engine_id": engine_id,
+                "kv_buffer_device": device_name,
+                "kv_connector_extra_config": {"connectors": [p2p_cfg, store_cfg]},
+            }
+        )
 
     def _spawn_pd_server(
         self,

@@ -509,17 +509,19 @@ disaggregation:
   # instead of vLLM's upstream rdma default (which falls back to TCP without a NIC).
   mooncake_protocol: nvlink
 
-  # Combine P2P KV transfer with MooncakeStoreConnector (shared KV cache pool).
-  # vLLM PD engines are launched with MultiConnector wrapping the P2P connector
-  # and MooncakeStoreConnector. Requires mooncake_master + MOONCAKE_CONFIG_PATH.
+  # Combine P2P KV transfer with a shared Mooncake KV cache pool.
+  # GPU: MultiConnector wrapping the P2P connector and MooncakeStoreConnector.
+  # NPU (transfer_backend mooncake|ascend): MooncakeConnectorV1 + AscendStoreConnector.
+  # Requires mooncake_master + MOONCAKE_CONFIG_PATH (NPU json protocol must be "ascend").
   enable_mooncake_store: False
 
   # Path to mooncake_config.json; forwarded as MOONCAKE_CONFIG_PATH to PD actors.
   # null = inherit the process / Ray runtime env.
   mooncake_store_config_path: null
 
-  # Decoder MooncakeStoreConnector: save completed decode KV into the pool.
+  # Decoder writes completed decode KV into the pool.
+  # GPU: MooncakeStoreConnector save_decode_cache. NPU: AscendStoreConnector consumer_is_to_put.
   save_decode_cache: False
 
-  # Extra MooncakeStoreConnector kv_connector_extra_config (store_tp_size, ...).
+  # Extra store kv_connector_extra_config (GPU: store_tp_size, ...; NPU: backend, lookup_rpc_port).
   mooncake_store_extra_config: {}

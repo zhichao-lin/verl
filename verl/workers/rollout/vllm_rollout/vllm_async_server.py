@@ -85,12 +85,15 @@ logger.setLevel(logging.INFO)
 
 
 def kv_cfg_uses_mooncake_p2p(kv_cfg: Optional[dict]) -> bool:
-    """True when the PD kv_transfer_config uses MooncakeConnector for P2P.
+    """True when the PD kv_transfer_config uses GPU MooncakeConnector for P2P.
 
     Covers the plain MooncakeConnector payload and MultiConnector wrapping
-    MooncakeConnector + MooncakeStoreConnector. Mooncake P2P does not return
-    decode kv_transfer_params from the prefill leg, so dispatch must build
-    them locally.
+    MooncakeConnector + MooncakeStoreConnector. GPU Mooncake P2P does not
+    return decode kv_transfer_params from the prefill leg, so dispatch must
+    build them locally.
+
+    MooncakeConnectorV1 (vLLM-Ascend) returns Nixl-like kv_transfer_params
+    and must not take this path.
     """
     if not kv_cfg:
         return False

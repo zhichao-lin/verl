@@ -26,6 +26,7 @@ vLLM-engine tests behind ``@pytest.mark.skipif(not CUDA_AVAILABLE)``.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from unittest.mock import patch
 
@@ -190,6 +191,9 @@ def _build_kv_cfg(
     save_decode_cache: bool = False,
     prefill_tp: int = 1,
     decode_tp: int = 1,
+    device_name: str = "cuda",
+    kv_port: int | None = None,
+    lookup_rpc_port: int | None = None,
 ):
     # Lazy import: only meaningful when vllm-rollout deps are importable.
     pytest.importorskip("vllm")
@@ -205,6 +209,9 @@ def _build_kv_cfg(
         save_decode_cache=save_decode_cache,
         prefill_tp=prefill_tp,
         decode_tp=decode_tp,
+        device_name=device_name,
+        kv_port=kv_port,
+        lookup_rpc_port=lookup_rpc_port,
     )
 
 
@@ -213,9 +220,7 @@ def test_build_kv_transfer_config_prefill_role_maps_to_kv_producer():
     assert cfg["kv_connector"] == "NixlConnector"
     assert cfg["kv_role"] == "kv_producer"
     assert cfg["engine_id"] == "e0"
-    from verl.utils.device import get_device_name
-
-    assert cfg["kv_buffer_device"] == get_device_name()
+    assert cfg["kv_buffer_device"] == "cuda"
     assert "kv_connector_extra_config" not in cfg
 
 
@@ -294,7 +299,12 @@ def test_disagg_config_enable_mooncake_store_with_nixl_ok():
     assert cfg.enable_mooncake_store is True
 
 
-@pytest.mark.parametrize("backend", ["ascend", "mori", "fake"])
+def test_disagg_config_enable_mooncake_store_with_ascend_ok():
+    cfg = DisaggregationConfig(enabled=True, transfer_backend="ascend", enable_mooncake_store=True)
+    assert cfg.enable_mooncake_store is True
+
+
+@pytest.mark.parametrize("backend", ["mori", "fake"])
 def test_disagg_config_enable_mooncake_store_rejects_unsupported_backend(backend):
     with pytest.raises(ValueError, match="enable_mooncake_store"):
         DisaggregationConfig(enabled=True, transfer_backend=backend, enable_mooncake_store=True)
@@ -473,6 +483,98 @@ def test_resolve_mooncake_store_requires_config_path(patched_replica_cls):
     assert not path
 
 
+def test_build_kv_transfer_config_npu_store_uses_ascend_connectors():
+    """vLLM-Ascend PD + pool: MooncakeConnectorV1 P2P + AscendStoreConnector."""
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        device_name="npu",
+        kv_port=20001,
+        lookup_rpc_port=0,
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    assert cfg["kv_connector"] == "MultiConnector"
+    assert cfg["kv_role"] == "kv_producer"
+    assert cfg["kv_port"] == 20001
+    assert cfg["kv_buffer_device"] == "npu"
+    children = cfg["kv_connector_extra_config"]["connectors"]
+    assert [c["kv_connector"] for c in children] == ["MooncakeConnectorV1", "AscendStoreConnector"]
+    p2p, store = children
+    assert p2p["kv_role"] == "kv_producer"
+    assert p2p["kv_port"] == 20001
+    assert p2p["kv_buffer_device"] == "npu"
+    assert p2p["kv_connector_extra_config"] == {
+        "prefill": {"dp_size": 1, "tp_size": 4},
+        "decode": {"dp_size": 1, "tp_size": 2},
+    }
+    assert store["kv_role"] == "kv_producer"
+    assert store["kv_connector_extra_config"]["backend"] == "mooncake"
+    assert store["kv_connector_extra_config"]["lookup_rpc_port"] == "0"
+    assert "store_tp_size" not in store["kv_connector_extra_config"]
+    assert "save_decode_cache" not in store["kv_connector_extra_config"]
+
+
+def test_build_kv_transfer_config_npu_save_decode_cache_maps_to_consumer_is_to_put():
+    decode = _build_kv_cfg(
+        role="decode",
+        transfer_backend="ascend",
+        enable_mooncake_store=True,
+        save_decode_cache=True,
+        device_name="npu",
+        kv_port=20002,
+        lookup_rpc_port=1,
+    )
+    store = decode["kv_connector_extra_config"]["connectors"][1]
+    assert store["kv_connector"] == "AscendStoreConnector"
+    assert store["kv_role"] == "kv_consumer"
+    assert store["kv_connector_extra_config"]["consumer_is_to_put"] is True
+    prefill = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="ascend",
+        enable_mooncake_store=True,
+        save_decode_cache=True,
+        device_name="npu",
+        kv_port=20001,
+        lookup_rpc_port=0,
+    )
+    prefill_store = prefill["kv_connector_extra_config"]["connectors"][1]
+    assert "consumer_is_to_put" not in prefill_store["kv_connector_extra_config"]
+
+
+def test_build_kv_transfer_config_npu_p2p_only_uses_mooncake_v1():
+    cfg = _build_kv_cfg(role="prefill", transfer_backend="mooncake", device_name="npu", kv_port=20001)
+    assert cfg["kv_connector"] == "MooncakeConnectorV1"
+    assert cfg["kv_port"] == 20001
+    assert cfg["kv_connector_extra_config"]["prefill"]["tp_size"] == 1
+
+
+def test_kv_cfg_uses_mooncake_p2p_ignores_ascend_v1():
+    """MooncakeConnectorV1 returns decode kv_transfer_params (Nixl-like).
+
+    Dispatch must not take the GPU Mooncake local-bootstrap path.
+    """
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import kv_cfg_uses_mooncake_p2p
+
+    assert kv_cfg_uses_mooncake_p2p({"kv_connector": "MooncakeConnectorV1"}) is False
+    assert (
+        kv_cfg_uses_mooncake_p2p(
+            {
+                "kv_connector": "MultiConnector",
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {"kv_connector": "MooncakeConnectorV1"},
+                        {"kv_connector": "AscendStoreConnector"},
+                    ]
+                },
+            }
+        )
+        is False
+    )
+
+
 def test_rollout_yaml_disagg_mooncake_store_fields_roundtrip():
     from omegaconf import OmegaConf
 
@@ -624,6 +726,52 @@ def test_resolve_mooncake_store_from_disagg_flag(patched_replica_cls):
     assert path == "/tmp/mooncake.json"
 
 
+@pytest.mark.parametrize(
+    "connector",
+    ["AscendStoreConnector", "MooncakeConnectorStoreV1"],
+)
+def test_resolve_mooncake_store_from_ascend_engine_kwargs(patched_replica_cls, connector):
+    """Colocated NPU offload yaml still opts PD into the store."""
+    cfg = _make_pd_config(
+        transfer_backend="ascend",
+        engine_kwargs={
+            "vllm": {
+                "kv_transfer_config": {
+                    "kv_connector": connector,
+                    "kv_role": "kv_producer",
+                    "kv_connector_extra_config": {
+                        "backend": "mooncake",
+                        "mooncake_config_path": "/tmp/from_ascend.json",
+                    },
+                }
+            }
+        },
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    enable, extra, path = replica._resolve_mooncake_store_settings()
+    assert enable is True
+    assert extra["backend"] == "mooncake"
+    assert "mooncake_config_path" not in extra
+    assert path == "/tmp/from_ascend.json"
+
+
+def test_validate_npu_pd_backend_allows_mooncake_and_ascend():
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import _validate_npu_pd_backend
+
+    _validate_npu_pd_backend(device_name="npu", transfer_backend="mooncake")
+    _validate_npu_pd_backend(device_name="npu", transfer_backend="ascend")
+    _validate_npu_pd_backend(device_name="cuda", transfer_backend="nixl")
+
+
+def test_validate_npu_pd_backend_rejects_nixl():
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import _validate_npu_pd_backend
+
+    with pytest.raises(NotImplementedError, match="NPU"):
+        _validate_npu_pd_backend(device_name="npu", transfer_backend="nixl")
+
+
 def test_resolve_mooncake_store_from_engine_kwargs(patched_replica_cls):
     """Colocated offload yaml (engine_kwargs MooncakeStoreConnector) still
     enables the store under PD; extras are harvested because PD overwrites
@@ -649,6 +797,12 @@ def test_resolve_mooncake_store_from_engine_kwargs(patched_replica_cls):
     assert extra["load_async"] is True
     assert "mooncake_config_path" not in extra
     assert path == "/tmp/from_engine.json"
+
+
+def test_pd_replica_init_accepts_ascend(patched_replica_cls):
+    cfg = _make_pd_config(transfer_backend="ascend")
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    assert replica.config.disaggregation.transfer_backend == "ascend"
 
 
 def test_pd_replica_init_rejects_unsupported_backend(patched_replica_cls):
@@ -784,8 +938,7 @@ def test_select_decode_peer_distribution_balanced_at_32_with_3_peers():
     assert max(counts.values()) - min(counts.values()) <= 1
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
+def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     """End-to-end shape of ``_pd_dispatch``: prefill leg sets max_tokens=1 +
     do_remote_decode, decode leg gets the prefill's kv_transfer_params."""
     from unittest.mock import MagicMock
@@ -824,11 +977,13 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     stub = _DispatchStub(decode_peers=[decode_peer])
     stub.generate = fake_generate
 
-    result = await server_cls._pd_dispatch(
-        stub,
-        prompt_ids=[1, 2, 3],
-        sampling_params={"max_tokens": 64, "temperature": 0.0},
-        request_id="req-foo",
+    result = asyncio.run(
+        server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2, 3],
+            sampling_params={"max_tokens": 64, "temperature": 0.0},
+            request_id="req-foo",
+        )
     )
 
     # Prefill leg was called once with max_tokens=1 + do_remote_decode params.
@@ -855,8 +1010,7 @@ async def test_pd_dispatch_routes_prefill_leg_then_decode_peer():
     assert result.token_ids == expected_decode_token_ids
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
+def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     """Under Mooncake, prefill's request_finished returns (_, None) — no
     kv_transfer_params come back. _pd_dispatch must instead construct decode
     kv_transfer_params from the prefill state set by set_pd_peer (engine_id +
@@ -879,11 +1033,13 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     stub = _DispatchStub(decode_peers=[decode_peer], connector="MooncakeConnector")
     stub.generate = fake_generate
 
-    await server_cls._pd_dispatch(
-        stub,
-        prompt_ids=[1, 2],
-        sampling_params={"max_tokens": 16, "temperature": 0.0},
-        request_id="req-mc",
+    asyncio.run(
+        server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2],
+            sampling_params={"max_tokens": 16, "temperature": 0.0},
+            request_id="req-mc",
+        )
     )
 
     assert len(captured_prefill) == 1
@@ -902,8 +1058,7 @@ async def test_pd_dispatch_mooncake_constructs_decode_kv_params_locally():
     assert dkv["transfer_id"] == transfer_id
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_multi_connector_mooncake_constructs_decode_kv_params():
+def test_pd_dispatch_multi_connector_mooncake_constructs_decode_kv_params():
     """MultiConnector wrapping MooncakeConnector must take the same local
     decode-params path: Mooncake P2P still returns no kv_transfer_params."""
     from unittest.mock import MagicMock
@@ -934,11 +1089,13 @@ async def test_pd_dispatch_multi_connector_mooncake_constructs_decode_kv_params(
     stub._disaggregation_kv_transfer_config = multi_cfg
     stub.generate = fake_generate
 
-    await server_cls._pd_dispatch(
-        stub,
-        prompt_ids=[1, 2],
-        sampling_params={"max_tokens": 16},
-        request_id="req-mc-store",
+    asyncio.run(
+        server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2],
+            sampling_params={"max_tokens": 16},
+            request_id="req-mc-store",
+        )
     )
 
     dkv = decode_peer.generate.remote.call_args.kwargs["kv_transfer_params"]
@@ -946,8 +1103,7 @@ async def test_pd_dispatch_multi_connector_mooncake_constructs_decode_kv_params(
     assert dkv["do_remote_prefill"] is True
 
 
-@pytest.mark.asyncio
-async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
+def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
     """Sanity: if NixlConnector silently produced no kv_transfer_params, fail
     fast rather than handing an empty dict to the decode peer."""
     server_cls = _import_http_server()
@@ -960,12 +1116,72 @@ async def test_pd_dispatch_raises_when_prefill_returns_no_kv_params():
     stub.generate = empty_prefill
 
     with pytest.raises(RuntimeError, match="no kv_transfer_params"):
-        await server_cls._pd_dispatch(
-            stub,
-            prompt_ids=[1],
-            sampling_params={"max_tokens": 8},
-            request_id="req-bare",
+        asyncio.run(
+            server_cls._pd_dispatch(
+                stub,
+                prompt_ids=[1],
+                sampling_params={"max_tokens": 8},
+                request_id="req-bare",
+            )
         )
+
+
+def test_pd_dispatch_ascend_v1_uses_prefill_kv_params():
+    """MooncakeConnectorV1 returns Nixl-like kv_transfer_params.
+
+    Dispatch must forward them, not invent GPU ``remote_bootstrap_addr``.
+    """
+    from unittest.mock import MagicMock
+
+    server_cls = _import_http_server()
+    v1_cfg = {
+        "kv_connector": "MultiConnector",
+        "kv_connector_extra_config": {
+            "connectors": [
+                {"kv_connector": "MooncakeConnectorV1", "kv_role": "kv_producer"},
+                {"kv_connector": "AscendStoreConnector", "kv_role": "kv_producer"},
+            ]
+        },
+    }
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import kv_cfg_uses_mooncake_p2p
+
+    assert kv_cfg_uses_mooncake_p2p(v1_cfg) is False
+
+    server_decode_kv = {
+        "do_remote_prefill": True,
+        "remote_engine_id": "eid-npu",
+        "remote_block_ids": [3, 4],
+        "remote_host": "10.0.0.8",
+        "remote_port": 20001,
+    }
+    decode_peer = MagicMock()
+    decode_peer.generate.remote = MagicMock(return_value=_make_awaitable_token_output([9]))
+
+    async def fake_generate(prompt_ids, sampling_params, request_id, **kw):
+        from verl.workers.rollout.replica import TokenOutput
+
+        return TokenOutput(
+            token_ids=[42],
+            stop_reason="completed",
+            extra_fields={"kv_transfer_params": server_decode_kv},
+        )
+
+    stub = _DispatchStub(decode_peers=[decode_peer], connector="MultiConnector")
+    stub._disaggregation_kv_transfer_config = v1_cfg
+    stub.generate = fake_generate
+
+    async def _run():
+        return await server_cls._pd_dispatch(
+            stub,
+            prompt_ids=[1, 2],
+            sampling_params={"max_tokens": 16},
+            request_id="req-v1",
+        )
+
+    asyncio.run(_run())
+    dkv = decode_peer.generate.remote.call_args.kwargs["kv_transfer_params"]
+    assert dkv == server_decode_kv
+    assert "remote_bootstrap_addr" not in dkv
 
 
 def _make_awaitable_token_output(token_ids):

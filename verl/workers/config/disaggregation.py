@@ -20,7 +20,7 @@ __all__ = ["DisaggregationConfig"]
 
 _ALLOWED_BACKENDS = ("nixl", "mooncake", "ascend", "mori", "fake")
 _ALLOWED_MOONCAKE_PROTOCOLS = ("nvlink", "local", "rdma", "tcp")
-_STORE_TRANSFER_BACKENDS = ("nixl", "mooncake")
+_STORE_TRANSFER_BACKENDS = ("nixl", "mooncake", "ascend")
 
 
 @dataclass
@@ -35,16 +35,19 @@ class DisaggregationConfig(BaseConfig):
     bootstrap_port: Optional[int] = None
     ib_device: Optional[str] = None
     mooncake_protocol: str = "nvlink"
-    # Wrap the P2P connector with MooncakeStoreConnector via vLLM MultiConnector
+    # Wrap the P2P connector with a store connector via vLLM MultiConnector
     # so PD engines share a Mooncake KV cache pool (prefix reuse / CPU offload).
+    # GPU: MooncakeStoreConnector. NPU / transfer_backend=ascend: AscendStoreConnector.
     enable_mooncake_store: bool = False
     # Path forwarded as MOONCAKE_CONFIG_PATH into each PD vLLM actor.
     # Falls back to the process env when null.
     mooncake_store_config_path: Optional[str] = None
-    # Decoder-side MooncakeStoreConnector extra: append completed decode blocks.
+    # Decoder-side store extra: GPU ``save_decode_cache``; NPU maps to
+    # ``consumer_is_to_put`` on AscendStoreConnector.
     save_decode_cache: bool = False
-    # Extra keys merged into the MooncakeStoreConnector kv_connector_extra_config
-    # (store_tp_size, load_async, cache_prefix, enable_store_tp_lcm, ...).
+    # Extra keys merged into the store connector kv_connector_extra_config
+    # (GPU: store_tp_size, load_async, cache_prefix, enable_store_tp_lcm;
+    #  NPU: backend, lookup_rpc_port, consumer_is_to_put, ...).
     mooncake_store_extra_config: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
