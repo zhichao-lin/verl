@@ -71,7 +71,9 @@ def _engine_kwargs_kv_transfer_config(config) -> Optional[dict]:
 
 def _with_store_tp_size(extra: dict, prefill_tp: int, decode_tp: int) -> dict:
     """Fill store_tp_size / LCM extras when prefill and decode TP differ."""
-    if extra.get("store_tp_size") or extra.get("enable_store_tp_lcm"):
+    # Key presence, not truthiness: ``enable_store_tp_lcm=False`` is a valid
+    # opt-out (rank-local keys) and must not be overwritten to True.
+    if "store_tp_size" in extra or "enable_store_tp_lcm" in extra:
         return extra
     if prefill_tp == decode_tp:
         return extra

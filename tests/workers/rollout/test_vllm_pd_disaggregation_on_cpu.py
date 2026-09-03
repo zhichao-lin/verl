@@ -213,7 +213,9 @@ def test_build_kv_transfer_config_prefill_role_maps_to_kv_producer():
     assert cfg["kv_connector"] == "NixlConnector"
     assert cfg["kv_role"] == "kv_producer"
     assert cfg["engine_id"] == "e0"
-    assert cfg["kv_buffer_device"] == "cuda"
+    from verl.utils.device import get_device_name
+
+    assert cfg["kv_buffer_device"] == get_device_name()
     assert "kv_connector_extra_config" not in cfg
 
 
@@ -389,6 +391,108 @@ def test_build_kv_transfer_config_user_store_tp_size_not_overwritten():
     extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
     assert extra["store_tp_size"] == 8
     assert "enable_store_tp_lcm" not in extra
+
+
+def test_build_kv_transfer_config_equal_tp_does_not_set_store_tp():
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        prefill_tp=4,
+        decode_tp=4,
+    )
+    store = cfg["kv_connector_extra_config"]["connectors"][1]
+    assert "kv_connector_extra_config" not in store
+
+
+def test_build_kv_transfer_config_explicit_lcm_false_not_overwritten():
+    """User can opt out of heterogeneous-TP store sharing (rank-local keys)."""
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        mooncake_store_extra_config={"enable_store_tp_lcm": False},
+        prefill_tp=4,
+        decode_tp=3,
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["enable_store_tp_lcm"] is False
+    assert "store_tp_size" not in extra
+    assert "prefill_tp_sizes" not in extra
+
+
+def test_build_kv_transfer_config_json_roundtrip_and_vllm_schema():
+    """PD MultiConnector payload must be JSON-serializable and a valid KVTransferConfig."""
+    import json
+
+    pytest.importorskip("vllm")
+    from vllm.config.kv_transfer import KVTransferConfig
+
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        mooncake_protocol="nvlink",
+        enable_mooncake_store=True,
+        save_decode_cache=True,
+        mooncake_store_extra_config={"load_async": False, "cache_prefix": "verl"},
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    dumped = json.dumps(cfg)
+    loaded = json.loads(dumped)
+    parent = KVTransferConfig(**loaded)
+    assert parent.kv_connector == "MultiConnector"
+    assert parent.kv_role == "kv_producer"
+    for child in loaded["kv_connector_extra_config"]["connectors"]:
+        KVTransferConfig(**child)
+
+
+def test_resolve_mooncake_store_json_string_engine_kwargs(patched_replica_cls):
+    cfg = _make_pd_config(
+        transfer_backend="mooncake",
+        engine_kwargs={
+            "vllm": {
+                "kv_transfer_config": (
+                    '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both",'
+                    '"kv_connector_extra_config":{"cache_prefix":"from-json"}}'
+                )
+            }
+        },
+    )
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    enable, extra, path = replica._resolve_mooncake_store_settings()
+    assert enable is True
+    assert extra["cache_prefix"] == "from-json"
+
+
+def test_resolve_mooncake_store_requires_config_path(patched_replica_cls):
+    cfg = _make_pd_config(transfer_backend="mooncake", enable_mooncake_store=True)
+    replica = patched_replica_cls(replica_rank=0, config=cfg, model_config=None, gpus_per_node=8)
+    enable, extra, path = replica._resolve_mooncake_store_settings()
+    assert enable is True
+    assert not path
+
+
+def test_rollout_yaml_disagg_mooncake_store_fields_roundtrip():
+    from omegaconf import OmegaConf
+
+    yaml_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "transfer_backend": "mooncake",
+            "enable_mooncake_store": True,
+            "mooncake_store_config_path": "/tmp/mooncake.json",
+            "save_decode_cache": True,
+            "mooncake_store_extra_config": {"load_async": False, "store_tp_size": 4},
+        }
+    )
+    cfg = RolloutConfig(name="vllm", disaggregation=yaml_cfg)
+    disagg = cfg.disaggregation
+    assert isinstance(disagg, DisaggregationConfig)
+    assert disagg.enable_mooncake_store is True
+    assert disagg.mooncake_store_config_path == "/tmp/mooncake.json"
+    assert disagg.save_decode_cache is True
+    assert disagg.mooncake_store_extra_config["store_tp_size"] == 4
 
 
 # ---------------------------------------------------------------------------
