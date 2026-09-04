@@ -92,8 +92,11 @@ prefill TP and decode TP differ, verl sets `store_tp_size` (or
 be `"ascend"` (install `mooncake-transfer-engine-npu`). When prefill TP and
 decode TP differ, verl sets `prefill_tp_size` / `decode_tp_size` on the store
 connector (not GPU `store_tp_size`). `save_decode_cache=True` maps to decode
-`consumer_is_to_put`. Prefill lookup RPC port is `"0"`; decode uses its
-side-channel port. `MooncakeConnectorV1.request_finished` returns
+`consumer_is_to_put`. Prefill and decode lookup RPC ports use each engine's
+side-channel base port (unique per instance; do not hard-code `"0"`).
+`disaggregation.bootstrap_port` pins the prefill base when set. NPU reserves
+`[kv_port, kv_port+tp)` for MooncakeConnectorV1 handshakes. Decode binds on
+the decode worker IP. `MooncakeConnectorV1.request_finished` returns
 `kv_transfer_params` (Nixl-like), so dispatch must **not** take the GPU
 Mooncake local-bootstrap path.
 

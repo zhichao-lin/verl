@@ -499,7 +499,9 @@ disaggregation:
   # KV cache transport: nixl | mooncake | ascend | mori | fake.
   transfer_backend: nixl
 
-  # Bootstrap server port on prefill side; null = auto-assign.
+  # Prefill side-channel / Mooncake bootstrap port; null = auto-assign.
+  # vLLM NPU (MooncakeConnectorV1) also reserves [port, port+prefill_tp) because
+  # handshake_port = kv_port + rank. Decode engines pick their own host+range.
   bootstrap_port: null
 
   # InfiniBand device (required for mooncake over RDMA).

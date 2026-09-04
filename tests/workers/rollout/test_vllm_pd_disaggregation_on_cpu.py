@@ -594,6 +594,108 @@ def test_build_kv_transfer_config_npu_save_decode_cache_maps_to_consumer_is_to_p
     assert "consumer_is_to_put" not in prefill_store["kv_connector_extra_config"]
 
 
+def _close_pd_side_channels(prefill, decodes) -> None:
+    for sock in list(prefill.socks) + [s for d in decodes for s in d.socks]:
+        sock.close()
+
+
+def test_allocate_pd_side_channels_npu_prefill_lookup_uses_base_port_not_zero():
+    """Prefill lookup_rpc_port must be unique per instance (IPC path suffix)."""
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import _allocate_pd_side_channels
+
+    # node_id, device, ip — 1P TP=2 + 1D TP=2
+    worker_infos = [
+        ("n0", "0", "127.0.0.1"),
+        ("n0", "1", "127.0.0.1"),
+        ("n0", "2", "127.0.0.1"),
+        ("n0", "3", "127.0.0.1"),
+    ]
+    prefill, decodes = _allocate_pd_side_channels(
+        worker_infos,
+        prefill_tp=2,
+        decode_tp=2,
+        n_decode=1,
+        npu_kv=True,
+        bootstrap_port=None,
+    )
+    try:
+        assert prefill.lookup_rpc_port == prefill.port
+        assert prefill.lookup_rpc_port != 0
+        assert prefill.kv_port == prefill.port
+        assert [s.getsockname()[1] for s in prefill.socks] == [prefill.port, prefill.port + 1]
+        assert decodes[0].lookup_rpc_port == decodes[0].port
+        assert [s.getsockname()[1] for s in decodes[0].socks] == [decodes[0].port, decodes[0].port + 1]
+        # Handshake ranges must not overlap on the same host.
+        prefill_ports = {prefill.port, prefill.port + 1}
+        decode_ports = {decodes[0].port, decodes[0].port + 1}
+        assert prefill_ports.isdisjoint(decode_ports)
+    finally:
+        _close_pd_side_channels(prefill, decodes)
+
+
+def test_allocate_pd_side_channels_honors_bootstrap_port():
+    pytest.importorskip("vllm")
+    from verl.utils.net_utils import get_free_port
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import _allocate_pd_side_channels
+
+    probe, probe_sock = get_free_port("127.0.0.1", with_alive_sock=True)
+    probe_sock.close()
+    worker_infos = [("n0", "0", "127.0.0.1"), ("n0", "1", "127.0.0.1")]
+    prefill, decodes = _allocate_pd_side_channels(
+        worker_infos,
+        prefill_tp=1,
+        decode_tp=1,
+        n_decode=1,
+        npu_kv=False,
+        bootstrap_port=probe,
+    )
+    try:
+        assert prefill.port == probe
+        assert prefill.kv_port is None
+        assert prefill.lookup_rpc_port is None
+        assert decodes[0].port != probe
+    finally:
+        _close_pd_side_channels(prefill, decodes)
+
+
+def test_allocate_pd_side_channels_decode_binds_on_decode_host():
+    pytest.importorskip("vllm")
+    from unittest.mock import patch
+
+    from verl.workers.rollout.vllm_rollout import vllm_pd_replica as mod
+
+    captured = []
+
+    def _fake_range(address, count, start=None):
+        captured.append({"address": address, "count": count, "start": start})
+        # Dummy sockets are never bound; tests only check the routing args.
+        return (40000 if address == "10.0.0.1" else 41000, [])
+
+    worker_infos = [
+        ("n-prefill", "0", "10.0.0.1"),
+        ("n-decode", "1", "10.0.0.2"),
+        ("n-decode", "2", "10.0.0.2"),
+    ]
+    with patch.object(mod, "get_free_port_range", _fake_range):
+        prefill, decodes = mod._allocate_pd_side_channels(
+            worker_infos,
+            prefill_tp=1,
+            decode_tp=2,
+            n_decode=1,
+            npu_kv=True,
+            bootstrap_port=None,
+        )
+    assert prefill.host == "10.0.0.1"
+    assert prefill.port == 40000
+    assert decodes[0].host == "10.0.0.2"
+    assert decodes[0].port == 41000
+    assert captured == [
+        {"address": "10.0.0.1", "count": 1, "start": None},
+        {"address": "10.0.0.2", "count": 2, "start": None},
+    ]
+
+
 def test_build_kv_transfer_config_npu_p2p_only_uses_mooncake_v1():
     cfg = _build_kv_cfg(role="prefill", transfer_backend="mooncake", device_name="npu", kv_port=20001)
     assert cfg["kv_connector"] == "MooncakeConnectorV1"
@@ -669,6 +771,7 @@ def _make_pd_config(**overrides) -> RolloutConfig:
         mooncake_store_config_path=overrides.pop("mooncake_store_config_path", None),
         save_decode_cache=overrides.pop("save_decode_cache", False),
         mooncake_store_extra_config=overrides.pop("mooncake_store_extra_config", {}),
+        bootstrap_port=overrides.pop("bootstrap_port", None),
     )
     return RolloutConfig(
         name="vllm",

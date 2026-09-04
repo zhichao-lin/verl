@@ -70,6 +70,18 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def _sock_family(address: str) -> int:
+    return socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
+
+
+def _bind_tcp(address: str, port: int, family: int | None = None) -> socket.socket:
+    family = _sock_family(address) if family is None else family
+    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((address, port))
+    return sock
+
+
 def get_free_port(address: str, with_alive_sock: bool = False) -> tuple[int, socket.socket | None]:
     """Find a free port on the given address.
 
@@ -79,13 +91,71 @@ def get_free_port(address: str, with_alive_sock: bool = False) -> tuple[int, soc
     responsible for closing the socket before the port is actually bound
     by the target service (e.g. NCCL, uvicorn).
     """
-    family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
-
-    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((address, 0))
+    sock = _bind_tcp(address, 0)
     port = sock.getsockname()[1]
     if with_alive_sock:
         return port, sock
     sock.close()
     return port, None
+
+
+def get_free_port_range(
+    address: str,
+    count: int,
+    start: int | None = None,
+    *,
+    max_attempts: int = 128,
+) -> tuple[int, list[socket.socket]]:
+    """Reserve ``count`` consecutive TCP ports on ``address``.
+
+    Used by vLLM-Ascend ``MooncakeConnectorV1``, which binds
+    ``handshake_port = kv_port + rank`` for ``rank`` in ``[0, tp)``.
+
+    When ``start`` is set, bind exactly ``[start, start+count)``.
+    Otherwise pick a free base and retry until the whole range is held.
+    Returned sockets stay open as reservations; the caller must close them.
+    """
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+
+    if start is not None:
+        last = start + count - 1
+        if start < 1 or last > 65535:
+            raise ValueError(f"port range [{start}, {last}] is not inside 1..65535")
+        return start, _bind_consecutive(address, start, count)
+
+    last_error: OSError | None = None
+    family = _sock_family(address)
+    for _ in range(max_attempts):
+        try:
+            probe = _bind_tcp(address, 0, family)
+        except OSError as exc:
+            last_error = exc
+            continue
+        base = probe.getsockname()[1]
+        if base + count - 1 > 65535:
+            probe.close()
+            continue
+        socks = [probe]
+        try:
+            for offset in range(1, count):
+                socks.append(_bind_tcp(address, base + offset, family))
+            return base, socks
+        except OSError as exc:
+            last_error = exc
+            for sock in socks:
+                sock.close()
+    raise RuntimeError(f"could not reserve {count} consecutive ports on {address}") from last_error
+
+
+def _bind_consecutive(address: str, start: int, count: int) -> list[socket.socket]:
+    family = _sock_family(address)
+    socks: list[socket.socket] = []
+    try:
+        for offset in range(count):
+            socks.append(_bind_tcp(address, start + offset, family))
+        return socks
+    except OSError:
+        for sock in socks:
+            sock.close()
+        raise

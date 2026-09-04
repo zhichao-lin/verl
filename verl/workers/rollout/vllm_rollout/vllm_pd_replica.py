@@ -19,14 +19,14 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import replace as _dc_replace
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Optional
 
 import ray
 from ray.actor import ActorHandle
 
 from verl.utils.device import get_device_name, get_resource_name
-from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.net_utils import get_free_port_range, is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
@@ -109,6 +109,62 @@ def _with_store_tp_size(extra: dict, prefill_tp: int, decode_tp: int) -> dict:
         extra["enable_store_tp_lcm"] = True
         extra["prefill_tp_sizes"] = [prefill_tp, decode_tp]
     return extra
+
+
+@dataclass
+class _PdSideChannel:
+    """One PD engine's reserved side-channel / kv_port base."""
+
+    host: str
+    port: int
+    socks: list
+    kv_port: Optional[int]
+    lookup_rpc_port: Optional[int]
+
+
+def _allocate_pd_side_channels(
+    worker_infos,
+    prefill_tp: int,
+    decode_tp: int,
+    n_decode: int,
+    npu_kv: bool,
+    bootstrap_port: Optional[int],
+) -> tuple[_PdSideChannel, list[_PdSideChannel]]:
+    """Reserve side-channel ports per PD engine.
+
+    GPU: one port per engine (NIXL / Mooncake env side-channel).
+    NPU: ``tp`` consecutive ports because MooncakeConnectorV1 handshake is
+    ``kv_port + rank``. Prefill ``lookup_rpc_port`` uses that same base so
+    multi-replica IPC paths do not collide on ``..._0_dp_rank0``.
+    Decode binds on the decode worker IP, not the prefill host.
+    """
+
+    def _one(host: str, tp: int, start: Optional[int]) -> _PdSideChannel:
+        count = tp if npu_kv else 1
+        base, socks = get_free_port_range(host, count, start=start)
+        return _PdSideChannel(
+            host=host,
+            port=base,
+            socks=socks,
+            kv_port=base if npu_kv else None,
+            lookup_rpc_port=base if npu_kv else None,
+        )
+
+    allocated: list[_PdSideChannel] = []
+    try:
+        prefill = _one(worker_infos[0][2], prefill_tp, bootstrap_port)
+        allocated.append(prefill)
+        decodes = []
+        for i in range(n_decode):
+            start_idx = prefill_tp + i * decode_tp
+            decodes.append(_one(worker_infos[start_idx][2], decode_tp, None))
+            allocated.append(decodes[-1])
+        return prefill, decodes
+    except Exception:
+        for plan in allocated:
+            for sock in plan.socks:
+                sock.close()
+        raise
 
 
 def _with_ascend_store_peer_tp(extra: dict, prefill_tp: int, decode_tp: int) -> dict:
@@ -217,8 +273,6 @@ class vLLMPDReplica(vLLMReplica):
             ]
         )
 
-        # Bind the side-channel on the prefill worker's node.
-        prefill_host_ip = worker_infos[0][2]
         prefill_engine_id = uuid.uuid4().hex
 
         prefill_end = self._prefill_tp
@@ -226,10 +280,7 @@ class vLLMPDReplica(vLLMReplica):
         prefill_node_id = worker_infos[0][0]
         prefill_devs = self._collect_cuda_devices(worker_infos[0:prefill_end])
 
-        # Keep side-channel sockets reserved until all actors bind.
         reserved_socks = []
-        prefill_side_channel_port, prefill_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-        reserved_socks.append(prefill_sock)
         try:
             store_enabled, store_extra, store_config_path = self._resolve_mooncake_store_settings()
             if store_enabled and not store_config_path:
@@ -237,6 +288,18 @@ class vLLMPDReplica(vLLMReplica):
                     "disaggregation.enable_mooncake_store=True requires "
                     "disaggregation.mooncake_store_config_path or MOONCAKE_CONFIG_PATH"
                 )
+            prefill_sc, decode_scs = _allocate_pd_side_channels(
+                worker_infos,
+                prefill_tp=self._prefill_tp,
+                decode_tp=self._decode_tp,
+                n_decode=self._n_decode,
+                npu_kv=npu_kv,
+                bootstrap_port=self.config.disaggregation.bootstrap_port,
+            )
+            reserved_socks.extend(prefill_sc.socks)
+            for decode_sc in decode_scs:
+                reserved_socks.extend(decode_sc.socks)
+
             prefill_kv_cfg = self._build_kv_transfer_config(
                 role="prefill",
                 engine_id=prefill_engine_id,
@@ -248,8 +311,8 @@ class vLLMPDReplica(vLLMReplica):
                 prefill_tp=self._prefill_tp,
                 decode_tp=self._decode_tp,
                 device_name=device_name,
-                kv_port=prefill_side_channel_port if npu_kv else None,
-                lookup_rpc_port=0 if npu_kv else None,
+                kv_port=prefill_sc.kv_port,
+                lookup_rpc_port=prefill_sc.lookup_rpc_port,
             )
             self._prefill_servers = [
                 self._spawn_pd_server(
@@ -259,24 +322,22 @@ class vLLMPDReplica(vLLMReplica):
                     cuda_visible_devices=prefill_devs,
                     tp=self._prefill_tp,
                     kv_transfer_config=prefill_kv_cfg,
-                    side_channel_host=prefill_host_ip,
-                    side_channel_port=prefill_side_channel_port,
-                    mooncake_bootstrap_port=prefill_side_channel_port,
+                    side_channel_host=prefill_sc.host,
+                    side_channel_port=prefill_sc.port,
+                    mooncake_bootstrap_port=prefill_sc.port,
                     mooncake_store_config_path=store_config_path,
                     actor_name=f"vllm_server_{self.replica_rank}_0{self.name_suffix}",
                     zmq_base_trainer_rank=0,
                 )
             ]
 
-            for i in range(self._n_decode):
+            for i, decode_sc in enumerate(decode_scs):
                 start = self._prefill_tp + i * self._decode_tp
                 end = start + self._decode_tp
                 workers_i = self.workers[start:end]
                 node_id_i = worker_infos[start][0]
                 devs_i = self._collect_cuda_devices(worker_infos[start:end])
 
-                decode_side_channel_port, decode_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-                reserved_socks.append(decode_sock)
                 decode_kv_cfg = self._build_kv_transfer_config(
                     role="decode",
                     engine_id=uuid.uuid4().hex,
@@ -288,8 +349,8 @@ class vLLMPDReplica(vLLMReplica):
                     prefill_tp=self._prefill_tp,
                     decode_tp=self._decode_tp,
                     device_name=device_name,
-                    kv_port=decode_side_channel_port if npu_kv else None,
-                    lookup_rpc_port=decode_side_channel_port if npu_kv else None,
+                    kv_port=decode_sc.kv_port,
+                    lookup_rpc_port=decode_sc.lookup_rpc_port,
                 )
                 self._decode_servers.append(
                     self._spawn_pd_server(
@@ -299,9 +360,9 @@ class vLLMPDReplica(vLLMReplica):
                         cuda_visible_devices=devs_i,
                         tp=self._decode_tp,
                         kv_transfer_config=decode_kv_cfg,
-                        side_channel_host=prefill_host_ip,
-                        side_channel_port=decode_side_channel_port,
-                        mooncake_bootstrap_port=prefill_side_channel_port,
+                        side_channel_host=decode_sc.host,
+                        side_channel_port=decode_sc.port,
+                        mooncake_bootstrap_port=prefill_sc.port,
                         mooncake_store_config_path=store_config_path,
                         actor_name=f"vllm_server_decode_{self.replica_rank}_{i}{self.name_suffix}",
                         zmq_base_trainer_rank=start,
@@ -320,7 +381,7 @@ class vLLMPDReplica(vLLMReplica):
 
         await self._prefill_servers[0].set_pd_peer.remote(
             self._decode_servers,
-            prefill_side_channel_port,
+            prefill_sc.port,
             prefill_engine_id,
         )
 
@@ -338,8 +399,8 @@ class vLLMPDReplica(vLLMReplica):
             self.replica_rank,
             self._server_address,
             prefill_engine_id,
-            prefill_host_ip,
-            prefill_side_channel_port,
+            prefill_sc.host,
+            prefill_sc.port,
             len(self._decode_servers),
         )
 
