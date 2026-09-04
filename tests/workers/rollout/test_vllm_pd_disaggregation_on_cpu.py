@@ -512,8 +512,59 @@ def test_build_kv_transfer_config_npu_store_uses_ascend_connectors():
     assert store["kv_role"] == "kv_producer"
     assert store["kv_connector_extra_config"]["backend"] == "mooncake"
     assert store["kv_connector_extra_config"]["lookup_rpc_port"] == "0"
+    # AscendStore peer-TP extras (not GPU store_tp_size): decode reads
+    # prefill_tp_size, prefill reads decode_tp_size.
+    assert store["kv_connector_extra_config"]["prefill_tp_size"] == 4
+    assert store["kv_connector_extra_config"]["decode_tp_size"] == 2
     assert "store_tp_size" not in store["kv_connector_extra_config"]
     assert "save_decode_cache" not in store["kv_connector_extra_config"]
+
+
+def test_build_kv_transfer_config_npu_store_peer_tp_on_decode_role():
+    """Decode store (kv_consumer) must see prefill_tp_size to enable TP mismatch."""
+    cfg = _build_kv_cfg(
+        role="decode",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        device_name="npu",
+        lookup_rpc_port=1,
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["prefill_tp_size"] == 4
+    assert extra["decode_tp_size"] == 2
+
+
+def test_build_kv_transfer_config_npu_equal_tp_omits_peer_tp_keys():
+    cfg = _build_kv_cfg(
+        role="prefill",
+        transfer_backend="mooncake",
+        enable_mooncake_store=True,
+        device_name="npu",
+        lookup_rpc_port=0,
+        prefill_tp=4,
+        decode_tp=4,
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert "prefill_tp_size" not in extra
+    assert "decode_tp_size" not in extra
+    assert extra["backend"] == "mooncake"
+
+
+def test_build_kv_transfer_config_npu_user_peer_tp_not_overwritten():
+    cfg = _build_kv_cfg(
+        role="decode",
+        transfer_backend="ascend",
+        enable_mooncake_store=True,
+        device_name="npu",
+        mooncake_store_extra_config={"prefill_tp_size": 8},
+        prefill_tp=4,
+        decode_tp=2,
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["prefill_tp_size"] == 8
+    assert "decode_tp_size" not in extra
 
 
 def test_build_kv_transfer_config_npu_save_decode_cache_maps_to_consumer_is_to_put():

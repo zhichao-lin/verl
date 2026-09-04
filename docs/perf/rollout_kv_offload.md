@@ -89,8 +89,9 @@ prefill TP and decode TP differ, verl sets `store_tp_size` (or
 
 **NPU (vLLM-Ascend).** Prefiller/decoder use `MooncakeConnectorV1` plus
 `AscendStoreConnector(backend=mooncake)`. The Mooncake JSON `protocol` must
-be `"ascend"` (install `mooncake-transfer-engine-npu`). Heterogeneous TP does
-not auto-fill GPU `store_tp_size`; `save_decode_cache=True` maps to decode
+be `"ascend"` (install `mooncake-transfer-engine-npu`). When prefill TP and
+decode TP differ, verl sets `prefill_tp_size` / `decode_tp_size` on the store
+connector (not GPU `store_tp_size`). `save_decode_cache=True` maps to decode
 `consumer_is_to_put`. Prefill lookup RPC port is `"0"`; decode uses its
 side-channel port. `MooncakeConnectorV1.request_finished` returns
 `kv_transfer_params` (Nixl-like), so dispatch must **not** take the GPU

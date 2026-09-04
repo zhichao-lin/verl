@@ -523,5 +523,6 @@ disaggregation:
   # GPU: MooncakeStoreConnector save_decode_cache. NPU: AscendStoreConnector consumer_is_to_put.
   save_decode_cache: False
 
-  # Extra store kv_connector_extra_config (GPU: store_tp_size, ...; NPU: backend, lookup_rpc_port).
+  # Extra store kv_connector_extra_config (GPU: store_tp_size, ...; NPU: backend, lookup_rpc_port,
+  # prefill_tp_size/decode_tp_size when P/D TP differ).
   mooncake_store_extra_config: {}

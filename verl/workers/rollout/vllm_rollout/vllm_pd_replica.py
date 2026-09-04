@@ -111,6 +111,22 @@ def _with_store_tp_size(extra: dict, prefill_tp: int, decode_tp: int) -> dict:
     return extra
 
 
+def _with_ascend_store_peer_tp(extra: dict, prefill_tp: int, decode_tp: int) -> dict:
+    """Fill AscendStore peer-TP extras when prefill and decode TP differ.
+
+    Decode (kv_consumer) reads ``prefill_tp_size``; prefill reads
+    ``decode_tp_size``. Putting both on both sides is correct. Key presence
+    is an opt-out, matching GPU ``store_tp_size`` / ``enable_store_tp_lcm``.
+    """
+    if "prefill_tp_size" in extra or "decode_tp_size" in extra:
+        return extra
+    if prefill_tp == decode_tp:
+        return extra
+    extra["prefill_tp_size"] = prefill_tp
+    extra["decode_tp_size"] = decode_tp
+    return extra
+
+
 class vLLMPDReplica(vLLMReplica):
     """Replica that runs vLLM in prefill-decode disaggregated mode."""
 
@@ -375,9 +391,9 @@ class vLLMPDReplica(vLLMReplica):
         ``MooncakeStoreConnector`` under ``MultiConnector``.
 
         NPU (or ``transfer_backend=ascend``): P2P ``MooncakeConnectorV1`` plus
-        ``AscendStoreConnector(backend=mooncake)``. Do not auto-fill GPU
-        ``store_tp_size`` extras; map ``save_decode_cache`` to
-        ``consumer_is_to_put`` on the decode store.
+        ``AscendStoreConnector(backend=mooncake)``. Heterogeneous TP fills
+        ``prefill_tp_size`` / ``decode_tp_size`` (not GPU ``store_tp_size``).
+        ``save_decode_cache`` maps to ``consumer_is_to_put`` on the decode store.
         """
         if device_name is None:
             device_name = get_device_name()
@@ -435,6 +451,9 @@ class vLLMPDReplica(vLLMReplica):
                 store_extra["lookup_rpc_port"] = str(lookup_rpc_port)
             if role == "decode" and save_decode_cache:
                 store_extra["consumer_is_to_put"] = True
+            store_extra = _with_ascend_store_peer_tp(
+                store_extra, prefill_tp=prefill_tp, decode_tp=decode_tp
+            )
             store_cfg = {
                 "kv_connector": "AscendStoreConnector",
                 "kv_role": kv_role,
