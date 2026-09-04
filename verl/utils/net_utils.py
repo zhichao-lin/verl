@@ -74,10 +74,17 @@ def _sock_family(address: str) -> int:
     return socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
 
 
-def _bind_tcp(address: str, port: int, family: int | None = None) -> socket.socket:
+def _bind_tcp(
+    address: str,
+    port: int,
+    family: int | None = None,
+    *,
+    reuse_addr: bool = False,
+) -> socket.socket:
     family = _sock_family(address) if family is None else family
     sock = socket.socket(family=family, type=socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if reuse_addr:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((address, port))
     return sock
 
@@ -91,7 +98,7 @@ def get_free_port(address: str, with_alive_sock: bool = False) -> tuple[int, soc
     responsible for closing the socket before the port is actually bound
     by the target service (e.g. NCCL, uvicorn).
     """
-    sock = _bind_tcp(address, 0)
+    sock = _bind_tcp(address, 0, reuse_addr=True)
     port = sock.getsockname()[1]
     if with_alive_sock:
         return port, sock
@@ -113,7 +120,8 @@ def get_free_port_range(
 
     When ``start`` is set, bind exactly ``[start, start+count)``.
     Otherwise pick a free base and retry until the whole range is held.
-    Returned sockets stay open as reservations; the caller must close them.
+    Binds without ``SO_REUSEADDR`` so the range is exclusive. Returned sockets
+    stay open as reservations; close them before the target service binds.
     """
     if count < 1:
         raise ValueError(f"count must be >= 1, got {count}")

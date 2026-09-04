@@ -369,6 +369,11 @@ class vLLMPDReplica(vLLMReplica):
                     )
                 )
 
+            # Exclusive bind: engines cannot listen while reservations are held.
+            for sock in reserved_socks:
+                sock.close()
+            reserved_socks.clear()
+
             await asyncio.gather(
                 *[
                     server.launch_server.remote(master_address=None, master_port=None, dp_rpc_port=None)

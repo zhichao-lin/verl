@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import socket
-import sys
 
 import pytest
 
@@ -46,7 +45,6 @@ def test_get_free_port_range_honors_explicit_start():
         _close(socks)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="SO_REUSEADDR allows double-bind on Windows")
 def test_get_free_port_range_rejects_occupied_start():
     holder, holder_sock = get_free_port("127.0.0.1", with_alive_sock=True)
     try:
