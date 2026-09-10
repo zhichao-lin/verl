@@ -407,8 +407,8 @@ actor_rollout_ref:
         auto_start: true
         address: null
         port: null
-        eviction_high_watermark_ratio: 0.9
-        eviction_ratio: 0.1
+        eviction_high_watermark_ratio: null
+        eviction_ratio: null
         default_kv_lease_ttl: null
         client_ttl: null
         enable_multi_tenants: false
@@ -419,7 +419,7 @@ actor_rollout_ref:
         mode: embedded
         protocol: null
         metadata_server: P2PHANDSHAKE
-        global_segment_size: 4GB
+        global_segment_size: 80GB
         local_buffer_size: 4GB
         device_name: ''
         tenant_id: default

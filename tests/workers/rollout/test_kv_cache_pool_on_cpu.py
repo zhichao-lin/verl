@@ -33,8 +33,6 @@ from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
     build_store_connector_config,
     materialize_mooncake_config,
     mooncake_json_path,
-    mooncake_master_actor_name,
-    mooncake_master_install_hint,
     p2p_connector_name,
     parse_size_to_bytes,
     probe_tcp,
@@ -63,36 +61,78 @@ def test_resolve_decode_tp():
 
 
 def test_resolve_store_tp_lcm_of_p_and_d():
-    size, extra = resolve_store_tp(
+    extra = resolve_store_tp(
         prefill_tp=4, decode_tp=2, prefill_tps=[4], user_store_tp_size=None, enable_store_tp_lcm=None
     )
-    assert size == 4
-    assert extra == {}
+    assert extra == {"store_tp_size": 4}
 
 
 def test_resolve_store_tp_user_override():
-    size, extra = resolve_store_tp(
+    extra = resolve_store_tp(
         prefill_tp=4, decode_tp=2, prefill_tps=[4], user_store_tp_size=8, enable_store_tp_lcm=None
     )
-    assert size == 8
-    assert extra == {}
+    assert extra == {"store_tp_size": 8}
 
 
 def test_resolve_store_tp_multi_p_auto_lcm():
-    size, extra = resolve_store_tp(
+    extra = resolve_store_tp(
         prefill_tp=4, decode_tp=2, prefill_tps=[4, 2], user_store_tp_size=None, enable_store_tp_lcm=None
     )
-    assert size == 4
-    assert extra["enable_store_tp_lcm"] is True
-    assert extra["prefill_tp_sizes"] == [4, 2]
+    assert extra == {"enable_store_tp_lcm": True, "prefill_tp_sizes": [4, 2]}
 
 
 def test_resolve_store_tp_multi_p_explicit_false():
-    size, extra = resolve_store_tp(
+    extra = resolve_store_tp(
         prefill_tp=4, decode_tp=2, prefill_tps=[4, 2], user_store_tp_size=None, enable_store_tp_lcm=False
     )
-    assert size == 4
-    assert extra == {}
+    assert extra == {"store_tp_size": 4}
+
+
+def test_resolve_store_tp_user_size_disables_auto_lcm():
+    extra = resolve_store_tp(
+        prefill_tp=4, decode_tp=2, prefill_tps=[4, 2], user_store_tp_size=8, enable_store_tp_lcm=None
+    )
+    assert extra == {"store_tp_size": 8}
+
+
+def test_resolve_store_tp_explicit_lcm_writes_prefill_tp_sizes():
+    extra = resolve_store_tp(
+        prefill_tp=4, decode_tp=2, prefill_tps=[4], user_store_tp_size=None, enable_store_tp_lcm=True
+    )
+    assert extra == {"enable_store_tp_lcm": True, "prefill_tp_sizes": [4]}
+
+
+def test_resolve_store_tp_explicit_lcm_uses_user_prefill_tp_sizes():
+    extra = resolve_store_tp(
+        prefill_tp=4,
+        decode_tp=2,
+        prefill_tps=[4],
+        user_store_tp_size=None,
+        enable_store_tp_lcm=True,
+        user_prefill_tp_sizes=[4, 2],
+    )
+    assert extra == {"enable_store_tp_lcm": True, "prefill_tp_sizes": [4, 2]}
+
+
+def test_resolve_store_tp_rejects_store_tp_and_lcm():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        resolve_store_tp(
+            prefill_tp=4, decode_tp=2, prefill_tps=[4], user_store_tp_size=8, enable_store_tp_lcm=True
+        )
+
+
+def test_resolve_store_tp_explicit_lcm_requires_prefill_tp_sizes():
+    with pytest.raises(ValueError, match="prefill_tp_sizes"):
+        resolve_store_tp(
+            prefill_tp=4, decode_tp=2, prefill_tps=[], user_store_tp_size=None, enable_store_tp_lcm=True
+        )
+
+
+def test_resolve_store_tp_lcm_validates_decode_against_prefill_lcm():
+    with pytest.raises(ValueError, match="store_tp_size"):
+        resolve_store_tp(
+            prefill_tp=4, decode_tp=8, prefill_tps=[4, 2], user_store_tp_size=None, enable_store_tp_lcm=None
+        )
 
 
 def test_gpu_json_keys():
@@ -194,7 +234,30 @@ def test_gpu_multiconnector_prefill():
     assert store["kv_role"] == "kv_both"
     assert store["kv_connector_extra_config"]["lookup_rpc_port"] == 19001
     assert store["kv_connector_extra_config"]["store_tp_size"] == 4
+    assert "enable_store_tp_lcm" not in store["kv_connector_extra_config"]
     assert "save_decode_cache" not in store["kv_connector_extra_config"]
+
+
+def test_gpu_multiconnector_lcm_omits_store_tp_size():
+    pool = KVCachePoolConfig(enabled=True)
+    cfg = build_kv_transfer_config(
+        role="prefill",
+        engine_id="e0",
+        kv_buffer_device="cuda",
+        transfer_backend="mooncake",
+        mooncake_protocol="nvlink",
+        use_ascend_mooncake_v1=False,
+        kv_port=None,
+        prefill_tp=4,
+        decode_tp=2,
+        cache_pool=pool,
+        lookup_rpc_port=19001,
+        prefill_tps=[4, 2],
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["enable_store_tp_lcm"] is True
+    assert extra["prefill_tp_sizes"] == [4, 2]
+    assert "store_tp_size" not in extra
 
 
 def test_gpu_multiconnector_decode_save_decode_cache():
@@ -395,28 +458,11 @@ def test_store_tp_rejects_decode_tp():
         )
 
 
-def _unwrap_actor_class(cls):
-    """Return the plain actor class even if @ray.remote wrapped it."""
-    meta = getattr(cls, "__ray_metadata__", None)
-    if meta is not None and getattr(meta, "modified_class", None) is not None:
-        return meta.modified_class
-    original = getattr(cls, "__ray_original_class__", None)
-    if original is not None:
-        return original
-    actor_cls = getattr(cls, "__ray_actor_class__", None)
-    if actor_cls is not None:
-        return actor_cls
-    return cls
-
-
 def _make_actor(**attrs):
-    cls = _unwrap_actor_class(MooncakeMasterActor)
-    actor = cls.__new__(cls)
-    actor._proc = MooncakeMasterProcess()
-    actor._address = None
+    actor = MooncakeMasterActor()
     for name, value in attrs.items():
         setattr(actor, name, value)
-    return actor, cls
+    return actor, MooncakeMasterActor
 
 
 def _fake_popen(*, poll=None, output=""):
@@ -427,15 +473,12 @@ def _fake_popen(*, poll=None, output=""):
     return fake
 
 
-def test_actor_name():
-    assert mooncake_master_actor_name("abc") == "verl_mooncake_master_abc"
-
-
 def test_master_cmd_minimal():
     cmd = build_mooncake_master_cmd(master=KVCachePoolMasterConfig(), port=50051, enable_offload=False)
     assert cmd[:3] == ["mooncake_master", "--port", "50051"]
     assert "--enable_offload=true" not in cmd
-    assert "--eviction_high_watermark_ratio" in cmd
+    assert "--eviction_high_watermark_ratio" not in cmd
+    assert "--eviction_ratio" not in cmd
 
 
 def test_master_cmd_ssd_and_tenants():
@@ -444,11 +487,15 @@ def test_master_cmd_ssd_and_tenants():
         tenant_quota_connector_type="file",
         tenant_quota_connector_uri="/etc/mooncake/tenant_quotas.yaml",
         client_ttl=120,
+        eviction_high_watermark_ratio=0.8,
+        eviction_ratio=0.2,
     )
     cmd = build_mooncake_master_cmd(master=master, port=50088, enable_offload=True)
     assert "--enable_offload=true" in cmd
     assert "--enable_multi_tenants=true" in cmd
     assert "--client_ttl" in cmd
+    assert cmd[cmd.index("--eviction_high_watermark_ratio") + 1] == "0.8"
+    assert cmd[cmd.index("--eviction_ratio") + 1] == "0.2"
 
 
 def test_process_stop_idempotent():
@@ -478,12 +525,6 @@ def test_probe_tcp_timeout():
     ):
         with pytest.raises(RuntimeError):
             probe_tcp("127.0.0.1", 50051, timeout_s=0.01, interval_s=0.01)
-
-
-def test_install_hint_platform_specific():
-    assert "npu" not in mooncake_master_install_hint(is_npu=False)
-    assert mooncake_master_install_hint(is_npu=False) == "mooncake-transfer-engine"
-    assert mooncake_master_install_hint(is_npu=True) == "mooncake-transfer-engine-npu"
 
 
 def test_missing_binary_uses_gpu_hint(monkeypatch):
@@ -621,6 +662,8 @@ def _patch_setup_ray(*, get_actor_side_effect="missing", npu=False):
     actor.start.remote.return_value = "start-ref"
     options_handle = MagicMock()
     options_handle.remote.return_value = actor
+    actor_cls = MagicMock()
+    actor_cls.options.return_value = options_handle
     get_actor_kwargs = {"return_value": actor}
     if get_actor_side_effect == "missing":
         get_actor_kwargs["side_effect"] = ValueError("not found")
@@ -633,10 +676,7 @@ def _patch_setup_ray(*, get_actor_side_effect="missing", npu=False):
         patch("ray.get_runtime_context", return_value=runtime) as runtime_ctx,
         patch("ray.kill") as kill,
         patch("atexit.register") as atexit_reg,
-        patch(
-            "verl.workers.rollout.vllm_rollout.kv_cache_pool.MooncakeMasterActor.options",
-            return_value=options_handle,
-        ) as options,
+        patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.ray.remote", return_value=actor_cls),
     ):
         yield SimpleNamespace(
             get_actor=get_actor,
@@ -644,7 +684,7 @@ def _patch_setup_ray(*, get_actor_side_effect="missing", npu=False):
             runtime=runtime_ctx,
             kill=kill,
             atexit_reg=atexit_reg,
-            options=options,
+            options=actor_cls.options,
             actor=actor,
             options_handle=options_handle,
         )
@@ -686,7 +726,7 @@ def test_setup_kv_cache_pool_creates_named_actor_on_miss():
         setup_kv_cache_pool(cfg)
     p.options.assert_called_once()
     kwargs = p.options.call_args.kwargs
-    assert kwargs["name"] == mooncake_master_actor_name("job-1")
+    assert kwargs["name"] == "verl_mooncake_master_job-1"
     strategy = kwargs["scheduling_strategy"]
     assert isinstance(strategy, NodeAffinitySchedulingStrategy)
     assert strategy.node_id == _DRIVER_NODE_ID
@@ -706,7 +746,7 @@ def test_setup_kv_cache_pool_reuses_existing_actor():
     cfg = _rollout_cfg()
     with _patch_setup_ray(get_actor_side_effect=None) as p:
         setup_kv_cache_pool(cfg)
-    p.get_actor.assert_called_once_with(mooncake_master_actor_name("job-1"))
+    p.get_actor.assert_called_once_with("verl_mooncake_master_job-1")
     p.options.assert_not_called()
     p.actor.get_address.remote.assert_called_once()
     p.actor.start.remote.assert_not_called()
@@ -739,7 +779,7 @@ def test_llm_server_manager_create_sets_up_pool_before_replicas():
     from verl.workers.rollout.llm_server import LLMServerManager
 
     src = inspect.getsource(LLMServerManager.create)
-    assert src.index("_setup_kv_cache_pool") < src.index("_initialize_llm_servers")
+    assert src.index("setup_kv_cache_pool") < src.index("_initialize_llm_servers")
 
 
 def test_validate_cache_pool_engine_kwargs_rejects_nonempty():

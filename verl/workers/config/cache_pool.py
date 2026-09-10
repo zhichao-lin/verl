@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -65,8 +66,8 @@ class KVCachePoolMasterConfig(BaseConfig):
     auto_start: bool = True
     address: Optional[str] = None
     port: Optional[int] = None
-    eviction_high_watermark_ratio: float = 0.9
-    eviction_ratio: float = 0.1
+    eviction_high_watermark_ratio: Optional[float] = None
+    eviction_ratio: Optional[float] = None
     default_kv_lease_ttl: Optional[int] = None
     client_ttl: Optional[int] = None
     enable_multi_tenants: bool = False
@@ -82,7 +83,7 @@ class KVCachePoolStoreConfig(BaseConfig):
     mode: str = "embedded"
     protocol: Optional[str] = None
     metadata_server: str = "P2PHANDSHAKE"
-    global_segment_size: str = "4GB"
+    global_segment_size: str = "80GB"
     local_buffer_size: str = "4GB"
     device_name: str = ""
     tenant_id: str = "default"

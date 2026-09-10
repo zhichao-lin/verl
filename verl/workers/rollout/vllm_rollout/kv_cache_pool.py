@@ -13,6 +13,7 @@
 # limitations under the License.
 """Pure helpers for Mooncake JSON, Store TP, MultiConnector assembly, and master actor."""
 
+import atexit
 import functools
 import json
 import math
@@ -22,6 +23,10 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+import ray
+from omegaconf import OmegaConf
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from verl.utils.device import is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -88,34 +93,42 @@ def resolve_store_tp(
     prefill_tps: list[int],
     user_store_tp_size: int | None,
     enable_store_tp_lcm: bool | None,
-) -> tuple[int, dict]:
-    """Return (store_tp_size, extra_fields_to_merge). extra may contain enable_store_tp_lcm/prefill_tp_sizes."""
+    user_prefill_tp_sizes: list[int] | None = None,
+) -> dict:
+    """Return extra fields: either store_tp_size or LCM keys, not both."""
+    if user_store_tp_size is not None and enable_store_tp_lcm is True:
+        raise ValueError("store_tp_size and enable_store_tp_lcm=True are mutually exclusive")
+
     heterogeneous_prefill = len(set(prefill_tps)) > 1
-    auto_multi_p_lcm = heterogeneous_prefill and enable_store_tp_lcm is not False
-
     if user_store_tp_size is not None:
-        store_tp = user_store_tp_size
-    elif auto_multi_p_lcm:
-        store_tp = functools.reduce(math.lcm, [*prefill_tps, decode_tp])
+        use_lcm = False
+    elif enable_store_tp_lcm is True:
+        use_lcm = True
+    elif enable_store_tp_lcm is False:
+        use_lcm = False
     else:
-        store_tp = math.lcm(prefill_tp, decode_tp)
+        use_lcm = heterogeneous_prefill
 
+    if use_lcm:
+        prefill_tp_sizes = list(user_prefill_tp_sizes if user_prefill_tp_sizes is not None else prefill_tps)
+        if not prefill_tp_sizes:
+            raise ValueError("enable_store_tp_lcm=True requires a non-empty prefill_tp_sizes")
+        store_tp = functools.reduce(math.lcm, prefill_tp_sizes)
+        _validate_store_tp(store_tp, prefill_tp=prefill_tp, decode_tp=decode_tp)
+        return {"enable_store_tp_lcm": True, "prefill_tp_sizes": prefill_tp_sizes}
+
+    store_tp = user_store_tp_size if user_store_tp_size is not None else math.lcm(prefill_tp, decode_tp)
+    _validate_store_tp(store_tp, prefill_tp=prefill_tp, decode_tp=decode_tp)
+    return {"store_tp_size": store_tp}
+
+
+def _validate_store_tp(store_tp: int, *, prefill_tp: int, decode_tp: int) -> None:
     for tp in (prefill_tp, decode_tp):
         if store_tp < tp or store_tp % tp != 0:
             raise ValueError(
                 f"store_tp_size={store_tp} must be >= and divisible by prefill_tp={prefill_tp} "
                 f"and decode_tp={decode_tp}"
             )
-
-    extra: dict = {}
-    if enable_store_tp_lcm is False:
-        return store_tp, extra
-    if auto_multi_p_lcm:
-        extra["enable_store_tp_lcm"] = True
-        extra["prefill_tp_sizes"] = prefill_tps
-    elif enable_store_tp_lcm is True:
-        extra["enable_store_tp_lcm"] = True
-    return store_tp, extra
 
 
 def mooncake_json_path(job_id: str) -> str:
@@ -224,21 +237,22 @@ def build_store_connector_config(
         kv_connector = "AscendStoreConnector"
         kv_role = _ROLE_TO_KV_ROLE[role]
     else:
-        store_tp, tp_extra = resolve_store_tp(
-            prefill_tp=prefill_tp,
-            decode_tp=decode_tp,
-            prefill_tps=prefill_tps,
-            user_store_tp_size=connector.store_tp_size,
-            enable_store_tp_lcm=connector.enable_store_tp_lcm,
+        extra.update(
+            resolve_store_tp(
+                prefill_tp=prefill_tp,
+                decode_tp=decode_tp,
+                prefill_tps=prefill_tps,
+                user_store_tp_size=connector.store_tp_size,
+                enable_store_tp_lcm=connector.enable_store_tp_lcm,
+                user_prefill_tp_sizes=connector.prefill_tp_sizes,
+            )
         )
-        extra["store_tp_size"] = store_tp
         if connector.lookup_async:
             extra["lookup_async"] = True
         if connector.cache_prefix:
             extra["cache_prefix"] = connector.cache_prefix
         if role == "decode" and connector.save_decode_cache:
             extra["save_decode_cache"] = True
-        extra.update(tp_extra)
         kv_connector = "MooncakeStoreConnector"
         kv_role = "kv_both" if role == "prefill" else "kv_consumer"
 
@@ -388,30 +402,17 @@ def _reject_non_default(obj, defaults: dict) -> None:
             raise ValueError(f"{name} is not supported on this platform")
 
 
-MOONCAKE_MASTER_ACTOR_PREFIX = "verl_mooncake_master_"
-
-
-def mooncake_master_actor_name(job_id: str) -> str:
-    """Return the Ray named-actor name for a job-level mooncake_master."""
-    return f"{MOONCAKE_MASTER_ACTOR_PREFIX}{job_id}"
-
-
-def mooncake_master_install_hint(*, is_npu: bool) -> str:
-    """Return the single pip/package name to install for the current platform."""
-    return "mooncake-transfer-engine-npu" if is_npu else "mooncake-transfer-engine"
-
-
 def build_mooncake_master_cmd(*, master: KVCachePoolMasterConfig, port: int, enable_offload: bool) -> list[str]:
     """Build the mooncake_master argv from master config and runtime flags."""
     cmd = [
         "mooncake_master",
         "--port",
         str(port),
-        "--eviction_high_watermark_ratio",
-        str(master.eviction_high_watermark_ratio),
-        "--eviction_ratio",
-        str(master.eviction_ratio),
     ]
+    if master.eviction_high_watermark_ratio is not None:
+        cmd.extend(["--eviction_high_watermark_ratio", str(master.eviction_high_watermark_ratio)])
+    if master.eviction_ratio is not None:
+        cmd.extend(["--eviction_ratio", str(master.eviction_ratio)])
     if master.default_kv_lease_ttl is not None:
         cmd.extend(["--default_kv_lease_ttl", str(master.default_kv_lease_ttl)])
     if master.client_ttl is not None:
@@ -526,11 +527,6 @@ class MooncakeMasterActor:
         self._address: str | None = None
 
     def start(self, master_cfg: dict, enable_offload: bool) -> str:
-        import ray
-
-        if getattr(self, "_proc", None) is None:
-            self._proc = MooncakeMasterProcess()
-
         master = (
             master_cfg
             if isinstance(master_cfg, KVCachePoolMasterConfig)
@@ -538,9 +534,7 @@ class MooncakeMasterActor:
         )
         ip = ray.util.get_node_ip_address().strip("[]")
         if master.port in (None, 0):
-            port, sock = get_free_port(ip)
-            if sock is not None:
-                sock.close()
+            port, _ = get_free_port(ip)
         else:
             port = master.port
 
@@ -549,8 +543,12 @@ class MooncakeMasterActor:
             self._proc.start(cmd)
         except FileNotFoundError as e:
             self.stop()
-            hint = mooncake_master_install_hint(is_npu=is_torch_npu_available(check_device=False))
-            raise RuntimeError(f"mooncake_master not found; install {hint}") from e
+            pkg = (
+                "mooncake-transfer-engine-npu"
+                if is_torch_npu_available(check_device=False)
+                else "mooncake-transfer-engine"
+            )
+            raise RuntimeError(f"mooncake_master not found; install {pkg}") from e
 
         address = format_host_port(ip, port)
         try:
@@ -572,34 +570,19 @@ class MooncakeMasterActor:
         if not self._child_is_alive():
             raise RuntimeError("mooncake_master exited before listening")
         probe_tcp(ip, port, is_alive=self._child_is_alive)
-        if not self._child_is_alive():
-            raise RuntimeError("mooncake_master exited before listening")
 
     def _stop_and_capture_output(self) -> str:
-        proc = getattr(self, "_proc", None)
-        if proc is None:
-            return ""
-        proc.stop()
-        return getattr(proc, "_output", "") or ""
+        self._proc.stop()
+        return self._proc._output or ""
 
     def get_address(self) -> str:
         return self._address
 
     def stop(self) -> None:
-        proc = getattr(self, "_proc", None)
-        if proc is not None:
-            proc.stop()
+        self._proc.stop()
 
     def __del__(self) -> None:
         self.stop()
-
-
-try:
-    import ray as _ray
-
-    MooncakeMasterActor = _ray.remote(num_cpus=0)(MooncakeMasterActor)
-except ImportError:
-    pass
 
 
 def setup_kv_cache_pool(rollout_cfg) -> None:
@@ -625,25 +608,13 @@ def setup_kv_cache_pool(rollout_cfg) -> None:
     if not auto_start:
         return
 
-    import atexit
-
-    import ray
-    from omegaconf import OmegaConf
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-    job_id = ray.get_runtime_context().get_job_id()
-    name = mooncake_master_actor_name(job_id)
-    actor_miss_errors = (ValueError,)
-    actor_not_found = getattr(ray.exceptions, "ActorNotFound", None)
-    if isinstance(actor_not_found, type) and issubclass(actor_not_found, BaseException):
-        actor_miss_errors = (ValueError, actor_not_found)
+    name = f"verl_mooncake_master_{ray.get_runtime_context().get_job_id()}"
     try:
         actor = ray.get_actor(name)
-        address = ray.get(actor.get_address.remote())
-    except actor_miss_errors:
+    except ValueError:
         enable_offload = bool((pool.get("store") or {}).get("ssd_offload_path"))
         driver_node = ray.get_runtime_context().get_node_id()
-        actor = MooncakeMasterActor.options(
+        actor = ray.remote(MooncakeMasterActor).options(
             name=name,
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node, soft=False),
         ).remote()
@@ -653,5 +624,7 @@ def setup_kv_cache_pool(rollout_cfg) -> None:
         except Exception:
             ray.kill(actor)
             raise
+    else:
+        address = ray.get(actor.get_address.remote())
     OmegaConf.update(rollout_cfg, "cache_pool.master.address", address, force_add=True)
     atexit.register(lambda: ray.get(actor.stop.remote()))

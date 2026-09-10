@@ -566,11 +566,11 @@ cache_pool:
     # Bind port when auto_start=true. null or 0 = pick a free port. Negative values raise.
     port: null
 
-    # mooncake_master --eviction_high_watermark_ratio
-    eviction_high_watermark_ratio: 0.9
+    # mooncake_master --eviction_high_watermark_ratio. null = omit.
+    eviction_high_watermark_ratio: null
 
-    # mooncake_master --eviction_ratio
-    eviction_ratio: 0.1
+    # mooncake_master --eviction_ratio. null = omit.
+    eviction_ratio: null
 
     # mooncake_master --default_kv_lease_ttl. null = omit.
     default_kv_lease_ttl: null
@@ -604,7 +604,7 @@ cache_pool:
     metadata_server: P2PHANDSHAKE
 
     # Per-rank CPU segment. NPU must be 1GB-aligned.
-    global_segment_size: 4GB
+    global_segment_size: 80GB
 
     # GPU JSON only.
     local_buffer_size: 4GB
@@ -646,13 +646,13 @@ cache_pool:
     # GPU decode. Written only when true.
     save_decode_cache: False
 
-    # GPU. null = lcm(prefill_tp, decode_tp). Always written after resolve.
+    # GPU. null = lcm(prefill_tp, decode_tp). Written only in store_tp_size mode.
     store_tp_size: null
 
-    # GPU. null = omit unless multi-P auto-lcm fires.
+    # GPU. Mutually exclusive with store_tp_size. null = auto-on when prefill TPs differ.
     enable_store_tp_lcm: null
 
-    # GPU. null = omit unless multi-P auto-lcm fires.
+    # GPU. Required in LCM mode. null = use runtime prefill TPs.
     prefill_tp_sizes: null
 
     # NPU. Written only when true.
