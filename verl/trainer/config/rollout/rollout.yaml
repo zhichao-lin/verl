@@ -493,21 +493,35 @@ disaggregation:
   # Other supported values: random, power_of_two, consistent_hash,
   # rendezvous_hash, cache_aware.
   decode_policy:
+
+    # Routing algorithm used to pick a decode peer.
     type: round_robin
 
   # Decode TP override; null = same as tensor_model_parallel_size.
   decode_tensor_model_parallel_size: null
 
-  # Per-role memory utilization; null inherits rollout.gpu_memory_utilization.
+  # Prefill GPU memory utilization; null inherits rollout.gpu_memory_utilization.
   prefill_gpu_memory_utilization: null
+
+  # Decode GPU memory utilization; null inherits rollout.gpu_memory_utilization.
   decode_gpu_memory_utilization: null
 
-  # Per-role vLLM kwargs, deep-merged over rollout.engine_kwargs.vllm.
+  # Prefill vLLM kwargs, deep-merged over rollout.engine_kwargs.vllm.
   prefill_engine_kwargs:
+
+    # Prefill max tokens in a batch; null keeps the engine default.
     max_num_batched_tokens: null
+
+    # Prefill max sequences in a batch; null keeps the engine default.
     max_num_seqs: null
+
+  # Decode vLLM kwargs, deep-merged over rollout.engine_kwargs.vllm.
   decode_engine_kwargs:
+
+    # Decode max tokens in a batch; null keeps the engine default.
     max_num_batched_tokens: null
+
+    # Decode max sequences in a batch; null keeps the engine default.
     max_num_seqs: null
 
   # KV cache transport: nixl | mooncake | ascend | mori | fake.
@@ -518,3 +532,140 @@ disaggregation:
 
   # InfiniBand device (required for mooncake over RDMA).
   ib_device: null
+
+# KV Cache Pool via MultiConnector (vLLM PD only).
+cache_pool:
+
+  # Master switch. Requires rollout.name=vllm, disaggregation.enabled=true,
+  # transfer_backend=mooncake, and enable_prefix_caching=true.
+  enabled: False
+
+  # NPU AscendStoreConnector backend. Options: mooncake, memcache, yuanrong.
+  # Only mooncake is implemented.
+  backend: mooncake
+
+  # Injected as PYTHONHASHSEED on every P/D server.
+  python_hash_seed: 0
+
+  # MultiConnector top-level kv_load_failure_policy. null = omit (vLLM default fail).
+  kv_load_failure_policy: null
+
+  # Merged into the Store child connector extra after first-class fields.
+  extra_config: {}
+
+  # mooncake_master lifecycle.
+  master:
+
+    # If true, LLMServerManager starts or reuses one mooncake_master for this driver.
+    auto_start: True
+
+    # host:port. Required when auto_start=false and store.config_path is null.
+    # Overwritten with the actor bind address when auto_start=true.
+    address: null
+
+    # Bind port when auto_start=true. null or 0 = pick a free port. Negative values raise.
+    port: null
+
+    # mooncake_master --eviction_high_watermark_ratio
+    eviction_high_watermark_ratio: 0.9
+
+    # mooncake_master --eviction_ratio
+    eviction_ratio: 0.1
+
+    # mooncake_master --default_kv_lease_ttl. null = omit.
+    default_kv_lease_ttl: null
+
+    # mooncake_master --client_ttl. null = omit.
+    client_ttl: null
+
+    # mooncake_master --enable_multi_tenants. Requires quota type and uri.
+    enable_multi_tenants: False
+
+    # --tenant_quota_connector_type (e.g. file). Required when enable_multi_tenants=true.
+    tenant_quota_connector_type: null
+
+    # --tenant_quota_connector_uri. Required when enable_multi_tenants=true.
+    tenant_quota_connector_uri: null
+
+  # Fields written into mooncake_config.json.
+  store:
+
+    # If set, skip JSON generation and point MOONCAKE_CONFIG_PATH here.
+    # Mutually exclusive with master.auto_start=true.
+    config_path: null
+
+    # Only embedded is implemented. standalone-store raises.
+    mode: embedded
+
+    # null = rdma on GPU, ascend on NPU. Allowed: GPU rdma|tcp, NPU ascend.
+    protocol: null
+
+    # Mooncake metadata_server.
+    metadata_server: P2PHANDSHAKE
+
+    # Per-rank CPU segment. NPU must be 1GB-aligned.
+    global_segment_size: 4GB
+
+    # GPU JSON only.
+    local_buffer_size: 4GB
+
+    # Independent from disaggregation.ib_device. NPU must stay empty.
+    device_name: ""
+
+    # Mooncake tenant. Non-default needs Mooncake >= 0.3.12.
+    tenant_id: default
+
+    # GPU JSON enable_offload. True raises NotImplementedError on GPU. Ignored on NPU.
+    enable_offload: False
+
+    # NPU SSD directory. Non-null on GPU raises. Non-null on NPU enables SSD.
+    ssd_offload_path: null
+
+    # NPU JSON only. Non-default on GPU raises.
+    preferred_segment: False
+
+    # NPU JSON only. Non-default on GPU raises.
+    prefer_alloc_in_same_node: True
+
+  # Store child kv_connector_extra_config first-class fields.
+  connector:
+
+    # null = omit (GPU default true, NPU default false in vLLM).
+    load_async: null
+
+    # null or empty = this instance engine_id as IPC suffix. Non-negative int or
+    # non-empty str used as-is (including 0 / "0"). Negatives and bools are invalid.
+    lookup_rpc_port: null
+
+    # GPU. Written only when true.
+    lookup_async: False
+
+    # GPU. Written only when non-empty.
+    cache_prefix: ""
+
+    # GPU decode. Written only when true.
+    save_decode_cache: False
+
+    # GPU. null = lcm(prefill_tp, decode_tp). Always written after resolve.
+    store_tp_size: null
+
+    # GPU. null = omit unless multi-P auto-lcm fires.
+    enable_store_tp_lcm: null
+
+    # GPU. null = omit unless multi-P auto-lcm fires.
+    prefill_tp_sizes: null
+
+    # NPU. Written only when true.
+    consumer_is_to_put: False
+
+    # NPU. Written only when true.
+    consumer_is_to_load: False
+
+    # NPU memcache-only. Rejected with backend=mooncake.
+    use_layerwise: False
+
+    # NPU PP. Written only when non-null. PD still rejects PP>1.
+    prefill_pp_size: null
+
+    # NPU PP partition string. Written only when non-null.
+    prefill_pp_layer_partition: null

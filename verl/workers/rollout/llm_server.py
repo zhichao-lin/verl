@@ -520,11 +520,18 @@ class LLMServerManager:
                 disaggregation_enabled=self.rollout_config.disaggregation.enabled,
             )
 
+    def _setup_kv_cache_pool(self):
+        """Start or reuse the job-level mooncake_master before launching replicas."""
+        from verl.workers.rollout.vllm_rollout.kv_cache_pool import setup_kv_cache_pool
+
+        setup_kv_cache_pool(self.rollout_config)
+
     @classmethod
     @auto_await
     async def create(cls, *args, **kwargs):
         """Create the LLMServerManager."""
         instance = cls(*args, **kwargs)
+        instance._setup_kv_cache_pool()
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         return instance

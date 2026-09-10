@@ -31,8 +31,14 @@ import ray
 from ray.actor import ActorHandle
 
 from verl.utils.device import get_device_name, get_resource_name, is_torch_npu_available
-from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.net_utils import get_free_port_range, is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.config.cache_pool import parse_lookup_rpc_port
+from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
+    build_kv_transfer_config,
+    mooncake_json_path,
+    validate_platform_cache_pool,
+)
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 logger = logging.getLogger(__file__)
@@ -146,6 +152,11 @@ class vLLMPDReplica(vLLMReplica):
             )
             transfer_backend = "mooncake"
 
+        pool = self.config.cache_pool
+        if pool.enabled:
+            self._validate_cache_pool_engine_kwargs(self.config)
+            validate_platform_cache_pool(cache_pool=pool, is_npu=use_ascend_mooncake_v1)
+
         worker_infos = await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
@@ -167,19 +178,26 @@ class vLLMPDReplica(vLLMReplica):
         prefill_devs = self._collect_cuda_devices(worker_infos[:prefill_end])
 
         reserved_socks = []
-        prefill_side_channel_port, prefill_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-        reserved_socks.append(prefill_sock)
+        span_p = self._kv_handshake_port_span(
+            use_ascend_mooncake_v1=use_ascend_mooncake_v1, tp=self._prefill_tp
+        )
+        prefill_side_channel_port = self._reserve_handshake_ports(
+            prefill_host_ip, span_p, reserved_socks
+        )
         try:
-            prefill_kv_cfg = self._build_kv_transfer_config(
-                role="prefill",
-                engine_id=prefill_engine_id,
-                transfer_backend=transfer_backend,
-                mooncake_protocol=self.config.disaggregation.mooncake_protocol,
-                use_ascend_mooncake_v1=use_ascend_mooncake_v1,
-                kv_port=prefill_side_channel_port,
-                prefill_tp=self._prefill_tp,
-                decode_tp=self._decode_tp,
-            )
+            if pool.enabled:
+                prefill_kv_cfg = None
+            else:
+                prefill_kv_cfg = self._build_kv_transfer_config(
+                    role="prefill",
+                    engine_id=prefill_engine_id,
+                    transfer_backend=transfer_backend,
+                    mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+                    use_ascend_mooncake_v1=use_ascend_mooncake_v1,
+                    kv_port=prefill_side_channel_port,
+                    prefill_tp=self._prefill_tp,
+                    decode_tp=self._decode_tp,
+                )
             self._prefill_servers = [
                 self._spawn_pd_server(
                     role="prefill",
@@ -194,6 +212,9 @@ class vLLMPDReplica(vLLMReplica):
                     mooncake_bootstrap_port=prefill_side_channel_port,
                     actor_name=f"vllm_server_{self.replica_rank}_0{self.name_suffix}",
                     zmq_base_trainer_rank=0,
+                    engine_id=prefill_engine_id,
+                    transfer_backend=transfer_backend,
+                    use_ascend_mooncake_v1=use_ascend_mooncake_v1,
                 )
             ]
 
@@ -204,18 +225,26 @@ class vLLMPDReplica(vLLMReplica):
                 node_id_i = worker_infos[start][0]
                 devs_i = self._collect_cuda_devices(worker_infos[start:end])
 
-                decode_side_channel_port, decode_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-                reserved_socks.append(decode_sock)
-                decode_kv_cfg = self._build_kv_transfer_config(
-                    role="decode",
-                    engine_id=uuid.uuid4().hex,
-                    transfer_backend=transfer_backend,
-                    mooncake_protocol=self.config.disaggregation.mooncake_protocol,
-                    use_ascend_mooncake_v1=use_ascend_mooncake_v1,
-                    kv_port=decode_side_channel_port,
-                    prefill_tp=self._prefill_tp,
-                    decode_tp=self._decode_tp,
+                span_d = self._kv_handshake_port_span(
+                    use_ascend_mooncake_v1=use_ascend_mooncake_v1, tp=self._decode_tp
                 )
+                decode_side_channel_port = self._reserve_handshake_ports(
+                    prefill_host_ip, span_d, reserved_socks
+                )
+                decode_engine_id = uuid.uuid4().hex
+                if pool.enabled:
+                    decode_kv_cfg = None
+                else:
+                    decode_kv_cfg = self._build_kv_transfer_config(
+                        role="decode",
+                        engine_id=decode_engine_id,
+                        transfer_backend=transfer_backend,
+                        mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+                        use_ascend_mooncake_v1=use_ascend_mooncake_v1,
+                        kv_port=decode_side_channel_port,
+                        prefill_tp=self._prefill_tp,
+                        decode_tp=self._decode_tp,
+                    )
                 self._decode_servers.append(
                     self._spawn_pd_server(
                         role="decode",
@@ -230,6 +259,9 @@ class vLLMPDReplica(vLLMReplica):
                         mooncake_bootstrap_port=prefill_side_channel_port,
                         actor_name=f"vllm_server_decode_{self.replica_rank}_{i}{self.name_suffix}",
                         zmq_base_trainer_rank=start,
+                        engine_id=decode_engine_id,
+                        transfer_backend=transfer_backend,
+                        use_ascend_mooncake_v1=use_ascend_mooncake_v1,
                     )
                 )
 
@@ -316,8 +348,33 @@ class vLLMPDReplica(vLLMReplica):
         return is_torch_npu_available(check_device=False)
 
     @staticmethod
+    def _kv_handshake_port_span(*, use_ascend_mooncake_v1: bool, tp: int) -> int:
+        if tp < 1:
+            raise ValueError(f"tp must be >= 1, got {tp}")
+        return tp if use_ascend_mooncake_v1 else 1
+
+    @staticmethod
+    def _reserve_handshake_ports(host, span, reserved_socks):
+        port, socks = get_free_port_range(host, span, with_alive_socks=True)
+        reserved_socks.extend(socks)
+        return port
+
+    @staticmethod
+    def _resolve_lookup_rpc_port(configured, engine_id: str) -> int | str:
+        if not engine_id:
+            raise ValueError("engine_id is required to resolve lookup_rpc_port")
+        parsed = parse_lookup_rpc_port(configured)
+        return engine_id if parsed is None else parsed
+
+    @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:
         return ",".join(worker_info[1] for worker_info in worker_infos)
+
+    @staticmethod
+    def _validate_cache_pool_engine_kwargs(config: RolloutConfig) -> None:
+        vllm_kwargs = (config.engine_kwargs or {}).get("vllm") or {}
+        if vllm_kwargs.get("kv_transfer_config"):
+            raise ValueError("engine_kwargs.vllm.kv_transfer_config")
 
     @staticmethod
     def _build_kv_transfer_config(
@@ -329,12 +386,11 @@ class vLLMPDReplica(vLLMReplica):
         kv_port: Optional[int] = None,
         prefill_tp: Optional[int] = None,
         decode_tp: Optional[int] = None,
+        cache_pool=None,
+        lookup_rpc_port=None,
+        prefill_tps=None,
     ) -> dict:
         """Assemble vLLM's ``--kv-transfer-config`` payload."""
-        role_to_kv_role = {
-            "prefill": "kv_producer",
-            "decode": "kv_consumer",
-        }
         if use_ascend_mooncake_v1:
             if transfer_backend != "mooncake":
                 raise ValueError("Ascend PD requires transfer_backend='mooncake'")
@@ -342,27 +398,20 @@ class vLLMPDReplica(vLLMReplica):
                 raise ValueError(
                     "MooncakeConnectorV1 requires kv_port, prefill_tp, and decode_tp"
                 )
-            connector = "MooncakeConnectorV1"
-        else:
-            connector = {
-                "nixl": "NixlConnector",
-                "mooncake": "MooncakeConnector",
-            }[transfer_backend]
-        cfg: dict = {
-            "kv_connector": connector,
-            "kv_role": role_to_kv_role[role],
-            "engine_id": engine_id,
-            "kv_buffer_device": get_device_name(),
-        }
-        if use_ascend_mooncake_v1:
-            cfg["kv_port"] = kv_port
-            cfg["kv_connector_extra_config"] = {
-                "prefill": {"dp_size": 1, "tp_size": prefill_tp},
-                "decode": {"dp_size": 1, "tp_size": decode_tp},
-            }
-        elif transfer_backend == "mooncake" and mooncake_protocol:
-            cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
-        return cfg
+        return build_kv_transfer_config(
+            role=role,
+            engine_id=engine_id,
+            kv_buffer_device=get_device_name(),
+            transfer_backend=transfer_backend,
+            mooncake_protocol=mooncake_protocol,
+            use_ascend_mooncake_v1=use_ascend_mooncake_v1,
+            kv_port=kv_port,
+            prefill_tp=prefill_tp,
+            decode_tp=decode_tp,
+            cache_pool=cache_pool,
+            lookup_rpc_port=lookup_rpc_port,
+            prefill_tps=prefill_tps,
+        )
 
     def _build_pd_role_config(self, role: str, tp: int) -> RolloutConfig:
         """Apply role-local vLLM settings without mutating the shared config."""
@@ -402,15 +451,38 @@ class vLLMPDReplica(vLLMReplica):
         node_id: str,
         cuda_visible_devices: str,
         tp: int,
-        kv_transfer_config: dict,
+        kv_transfer_config: Optional[dict],
         side_channel_host: str,
         side_channel_port: int,
         mooncake_bootstrap_port: int,
         actor_name: str,
         zmq_base_trainer_rank: int = 0,
+        engine_id: Optional[str] = None,
+        transfer_backend: Optional[str] = None,
+        use_ascend_mooncake_v1: bool = False,
     ) -> ActorHandle:
         """Construct one PD ``vLLMHttpServer`` actor."""
         per_role_config = self._build_pd_role_config(role, tp)
+        pool = self.config.cache_pool
+        job_id = ray.get_runtime_context().get_job_id()
+
+        if pool.enabled:
+            if engine_id is None or transfer_backend is None:
+                raise ValueError("cache_pool.enabled requires engine_id and transfer_backend")
+            lookup_port = self._resolve_lookup_rpc_port(pool.connector.lookup_rpc_port, engine_id)
+            kv_transfer_config = self._build_kv_transfer_config(
+                role=role,
+                engine_id=engine_id,
+                transfer_backend=transfer_backend,
+                mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+                use_ascend_mooncake_v1=use_ascend_mooncake_v1,
+                kv_port=side_channel_port,
+                prefill_tp=self._prefill_tp,
+                decode_tp=self._decode_tp,
+                cache_pool=pool,
+                lookup_rpc_port=lookup_port,
+                prefill_tps=[self._prefill_tp],
+            )
 
         env_vars = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
@@ -422,8 +494,11 @@ class vLLMPDReplica(vLLMReplica):
             # Avoid Mooncake TCP port exhaustion under validation concurrency.
             "MC_TCP_ENABLE_CONNECTION_POOL": os.environ.get("MC_TCP_ENABLE_CONNECTION_POOL", "1"),
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
-            "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
+            "VERL_RAY_JOB_ID": job_id,
         }
+        if pool.enabled:
+            env_vars["PYTHONHASHSEED"] = str(pool.python_hash_seed)
+            env_vars["MOONCAKE_CONFIG_PATH"] = pool.store.config_path or mooncake_json_path(job_id)
 
         return self.server_class.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
