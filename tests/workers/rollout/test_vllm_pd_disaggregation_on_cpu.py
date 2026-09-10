@@ -964,26 +964,6 @@ def test_reserve_handshake_ports_span_four():
             sock.close()
 
 
-def test_resolve_lookup_rpc_port():
-    pytest.importorskip("vllm")
-    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
-
-    resolve = vLLMPDReplica._resolve_lookup_rpc_port
-    assert resolve(None, "abc") == "abc"
-    assert resolve("", "abc") == "abc"
-    assert resolve("   ", "abc") == "abc"
-    assert resolve(0, "abc") == 0
-    assert resolve("0", "abc") == "0"
-    assert resolve(" 01 ", "abc") == "01"
-    assert resolve(19001, "abc") == 19001
-    assert resolve("custom", "abc") == "custom"
-    with pytest.raises(ValueError, match="engine_id"):
-        resolve(None, "")
-    for bad in (-1, "-1", " -2 ", True, False):
-        with pytest.raises(ValueError, match="lookup_rpc_port"):
-            resolve(bad, "abc")
-
-
 def test_launch_servers_decode_bootstrap_is_prefill_block_start():
     """Decode mooncake_bootstrap_port must be Prefill handshake block start."""
     pytest.importorskip("vllm")
@@ -1069,4 +1049,93 @@ def test_launch_servers_decode_bootstrap_is_prefill_block_start():
     assert decode["side_channel_port"] != prefill["side_channel_port"]
     for kwargs in spawn_kwargs:
         assert "reserved_socks" not in kwargs
+
+
+def _launch_servers_replica(*, transfer_backend, cache_pool):
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
+
+    cfg = _make_pd_config(
+        tensor_model_parallel_size=1,
+        decode_replicas=1,
+        transfer_backend=transfer_backend,
+        cache_pool=cache_pool,
+    )
+    replica = vLLMPDReplica.__new__(vLLMPDReplica)
+    replica.replica_rank = 0
+    replica.name_suffix = ""
+    replica.config = cfg
+    replica._prefill_tp = 1
+    replica._decode_tp = 1
+    replica._n_decode = 1
+    replica.world_size = 2
+    replica._prefill_servers = []
+    replica._decode_servers = []
+
+    async def worker_info(*_a, **_k):
+        return ("node-id", "0", "127.0.0.1")
+
+    workers = []
+    for _ in range(2):
+        worker = MagicMock()
+        worker.__ray_call__ = MagicMock()
+        worker.__ray_call__.remote = lambda *_a, **_k: worker_info()
+        workers.append(worker)
+    replica.workers = workers
+    return replica
+
+
+def test_launch_servers_gpu_pool_rejects_nixl():
+    replica = _launch_servers_replica(
+        transfer_backend="nixl",
+        cache_pool={"enabled": True},
+    )
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
+
+    with (
+        patch.object(vLLMPDReplica, "_is_ascend_platform", return_value=False),
+        pytest.raises(ValueError, match="mooncake"),
+    ):
+        import asyncio
+
+        asyncio.run(replica.launch_servers())
+
+
+def test_launch_servers_npu_pool_nixl_falls_back_to_mooncake():
+    pytest.importorskip("vllm")
+    import asyncio
+
+    from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
+
+    replica = _launch_servers_replica(
+        transfer_backend="nixl",
+        cache_pool={"enabled": True},
+    )
+    spawn_kwargs = []
+
+    async def _done(*_a, **_k):
+        return None
+
+    async def _addr(*_a, **_k):
+        return ("127.0.0.1", 8000)
+
+    def fake_spawn(**kwargs):
+        spawn_kwargs.append(kwargs)
+        server = MagicMock()
+        server.launch_server.remote = _done
+        server.set_pd_peer.remote = _done
+        server.get_server_address.remote = _addr
+        return server
+
+    with (
+        patch.object(vLLMPDReplica, "_is_ascend_platform", return_value=True),
+        patch.object(replica, "_spawn_pd_server", side_effect=fake_spawn),
+        patch.object(replica, "_collect_cuda_devices", return_value="0"),
+    ):
+        asyncio.run(replica.launch_servers())
+
+    assert spawn_kwargs
+    for kwargs in spawn_kwargs:
+        assert kwargs["transfer_backend"] == "mooncake"
+        assert kwargs["use_ascend_mooncake_v1"] is True
 

@@ -34,7 +34,6 @@ from verl.workers.config.cache_pool import (
     KVCachePoolConfig,
     KVCachePoolMasterConfig,
     KVCachePoolStoreConfig,
-    parse_lookup_rpc_port,
 )
 
 _ROLE_TO_KV_ROLE = {
@@ -208,18 +207,17 @@ def build_store_connector_config(
     role: str,
     is_npu: bool,
     cache_pool: KVCachePoolConfig,
-    lookup_rpc_port: int | str,
+    engine_id: str,
     prefill_tp: int,
     decode_tp: int,
     prefill_tps: list[int],
 ) -> dict:
     """Build the Store child connector dict for GPU or NPU."""
-    parsed = parse_lookup_rpc_port(lookup_rpc_port)
-    if parsed is None:
-        raise ValueError(f"lookup_rpc_port must be a non-negative int or str, got {lookup_rpc_port!r}")
+    if not isinstance(engine_id, str) or not engine_id:
+        raise ValueError(f"engine_id is required to set lookup_rpc_port, got {engine_id!r}")
 
     connector = cache_pool.connector
-    extra: dict = {"lookup_rpc_port": parsed}
+    extra: dict = {}
     if connector.load_async is not None:
         extra["load_async"] = connector.load_async
 
@@ -257,6 +255,7 @@ def build_store_connector_config(
         kv_role = "kv_both" if role == "prefill" else "kv_consumer"
 
     extra.update(cache_pool.extra_config)
+    extra["lookup_rpc_port"] = engine_id
     return {
         "kv_connector": kv_connector,
         "kv_role": kv_role,
@@ -276,7 +275,6 @@ def build_kv_transfer_config(
     prefill_tp: int | None,
     decode_tp: int | None,
     cache_pool: KVCachePoolConfig | None = None,
-    lookup_rpc_port: int | str | None = None,
     prefill_tps: list[int] | None = None,
 ) -> dict:
     """Assemble a single P2P connector or a MultiConnector with a Store child."""
@@ -299,7 +297,7 @@ def build_kv_transfer_config(
         role=role,
         is_npu=use_ascend_mooncake_v1,
         cache_pool=cache_pool,
-        lookup_rpc_port=lookup_rpc_port,
+        engine_id=engine_id,
         prefill_tp=resolved_prefill_tp,
         decode_tp=resolved_decode_tp,
         prefill_tps=resolved_prefill_tps,

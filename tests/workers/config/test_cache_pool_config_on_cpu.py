@@ -16,10 +16,8 @@ import pytest
 from verl.workers.config import RolloutConfig
 from verl.workers.config.cache_pool import (
     KVCachePoolConfig,
-    KVCachePoolConnectorConfig,
     KVCachePoolMasterConfig,
     KVCachePoolStoreConfig,
-    parse_lookup_rpc_port,
 )
 
 
@@ -30,7 +28,7 @@ def test_defaults_disabled_skip_validation():
     assert cfg.python_hash_seed == 0
     assert cfg.master.auto_start is True
     assert cfg.store.mode == "embedded"
-    assert cfg.connector.lookup_rpc_port is None
+    assert cfg.store.global_segment_size == "4GB"
 
 
 def test_nested_dict_coercion():
@@ -140,11 +138,21 @@ def test_rollout_cache_pool_requires_vllm_pd():
         RolloutConfig(name="vllm", cache_pool={"enabled": True})
 
 
-def test_rollout_cache_pool_requires_mooncake_transfer():
+def test_rollout_cache_pool_allows_nixl_transfer():
+    cfg = RolloutConfig(
+        name="vllm",
+        disaggregation={"enabled": True, "transfer_backend": "nixl"},
+        cache_pool={"enabled": True},
+    )
+    assert cfg.cache_pool.enabled is True
+    assert cfg.disaggregation.transfer_backend == "nixl"
+
+
+def test_rollout_cache_pool_rejects_unsupported_transfer():
     with pytest.raises(ValueError, match="mooncake"):
         RolloutConfig(
             name="vllm",
-            disaggregation={"enabled": True, "transfer_backend": "nixl"},
+            disaggregation={"enabled": True, "transfer_backend": "mori"},
             cache_pool={"enabled": True},
         )
 
@@ -175,36 +183,3 @@ def test_rollout_cache_pool_vllm_pd_mooncake_ok():
         cache_pool={"enabled": True},
     )
     assert cfg.cache_pool.enabled is True
-
-
-def test_parse_lookup_rpc_port_unspecified():
-    assert parse_lookup_rpc_port(None) is None
-    assert parse_lookup_rpc_port("") is None
-    assert parse_lookup_rpc_port("   ") is None
-
-
-def test_parse_lookup_rpc_port_configured():
-    assert parse_lookup_rpc_port(0) == 0
-    assert parse_lookup_rpc_port("0") == "0"
-    assert parse_lookup_rpc_port("-0") == "-0"
-    assert parse_lookup_rpc_port(" 01 ") == "01"
-    assert parse_lookup_rpc_port(19001) == 19001
-    assert parse_lookup_rpc_port("custom") == "custom"
-
-
-@pytest.mark.parametrize("value", [-1, "-1", " -2 ", True, False, 1.5])
-def test_parse_lookup_rpc_port_rejects_illegal(value):
-    with pytest.raises(ValueError, match="lookup_rpc_port"):
-        parse_lookup_rpc_port(value)
-
-
-def test_connector_rejects_negative_lookup_even_when_disabled():
-    with pytest.raises(ValueError, match="lookup_rpc_port"):
-        KVCachePoolConnectorConfig(lookup_rpc_port=-1)
-    with pytest.raises(ValueError, match="lookup_rpc_port"):
-        KVCachePoolConfig(enabled=False, connector={"lookup_rpc_port": "-1"})
-
-
-def test_lookup_rpc_port_string_coercion():
-    cfg = KVCachePoolConfig(connector={"lookup_rpc_port": "custom-lookup"})
-    assert cfg.connector.lookup_rpc_port == "custom-lookup"

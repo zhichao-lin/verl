@@ -537,7 +537,7 @@ disaggregation:
 cache_pool:
 
   # Master switch. Requires rollout.name=vllm, disaggregation.enabled=true,
-  # transfer_backend=mooncake, and enable_prefix_caching=true.
+  # transfer_backend=mooncake (NPU nixl is remapped), and enable_prefix_caching=true.
   enabled: False
 
   # NPU AscendStoreConnector backend. Options: mooncake, memcache, yuanrong.
@@ -604,7 +604,7 @@ cache_pool:
     metadata_server: P2PHANDSHAKE
 
     # Per-rank CPU segment. NPU must be 1GB-aligned.
-    global_segment_size: 80GB
+    global_segment_size: 4GB
 
     # GPU JSON only.
     local_buffer_size: 4GB
@@ -632,10 +632,6 @@ cache_pool:
 
     # null = omit (GPU default true, NPU default false in vLLM).
     load_async: null
-
-    # null or empty = this instance engine_id as IPC suffix. Non-negative int or
-    # non-empty str used as-is (including 0 / "0"). Negatives and bools are invalid.
-    lookup_rpc_port: null
 
     # GPU. Written only when true.
     lookup_async: False

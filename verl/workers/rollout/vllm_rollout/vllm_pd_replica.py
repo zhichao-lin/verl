@@ -33,7 +33,6 @@ from ray.actor import ActorHandle
 from verl.utils.device import get_device_name, get_resource_name, is_torch_npu_available
 from verl.utils.net_utils import get_free_port_range, is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.config.cache_pool import parse_lookup_rpc_port
 from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
     build_kv_transfer_config,
     mooncake_json_path,
@@ -156,6 +155,11 @@ class vLLMPDReplica(vLLMReplica):
         if pool.enabled:
             self._validate_cache_pool_engine_kwargs(self.config)
             validate_platform_cache_pool(cache_pool=pool, is_npu=use_ascend_mooncake_v1)
+            if transfer_backend != "mooncake":
+                raise ValueError(
+                    "cache_pool.enabled=True requires transfer_backend='mooncake' "
+                    f"after NPU nixl remap; got {transfer_backend!r}."
+                )
 
         worker_infos = await asyncio.gather(
             *[
@@ -360,13 +364,6 @@ class vLLMPDReplica(vLLMReplica):
         return port
 
     @staticmethod
-    def _resolve_lookup_rpc_port(configured, engine_id: str) -> int | str:
-        if not engine_id:
-            raise ValueError("engine_id is required to resolve lookup_rpc_port")
-        parsed = parse_lookup_rpc_port(configured)
-        return engine_id if parsed is None else parsed
-
-    @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:
         return ",".join(worker_info[1] for worker_info in worker_infos)
 
@@ -387,7 +384,6 @@ class vLLMPDReplica(vLLMReplica):
         prefill_tp: Optional[int] = None,
         decode_tp: Optional[int] = None,
         cache_pool=None,
-        lookup_rpc_port=None,
         prefill_tps=None,
     ) -> dict:
         """Assemble vLLM's ``--kv-transfer-config`` payload."""
@@ -409,7 +405,6 @@ class vLLMPDReplica(vLLMReplica):
             prefill_tp=prefill_tp,
             decode_tp=decode_tp,
             cache_pool=cache_pool,
-            lookup_rpc_port=lookup_rpc_port,
             prefill_tps=prefill_tps,
         )
 
@@ -469,7 +464,6 @@ class vLLMPDReplica(vLLMReplica):
         if pool.enabled:
             if engine_id is None or transfer_backend is None:
                 raise ValueError("cache_pool.enabled requires engine_id and transfer_backend")
-            lookup_port = self._resolve_lookup_rpc_port(pool.connector.lookup_rpc_port, engine_id)
             kv_transfer_config = self._build_kv_transfer_config(
                 role=role,
                 engine_id=engine_id,
@@ -480,7 +474,6 @@ class vLLMPDReplica(vLLMReplica):
                 prefill_tp=self._prefill_tp,
                 decode_tp=self._decode_tp,
                 cache_pool=pool,
-                lookup_rpc_port=lookup_port,
                 prefill_tps=[self._prefill_tp],
             )
 

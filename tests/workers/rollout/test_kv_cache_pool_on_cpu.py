@@ -151,6 +151,7 @@ def test_gpu_json_keys():
     }
     assert data["protocol"] == "rdma"
     assert data["enable_offload"] is False
+    assert data["global_segment_size"] == "4GB"
     assert "ssd_offload_path" not in data
 
 
@@ -219,7 +220,6 @@ def test_gpu_multiconnector_prefill():
         prefill_tp=4,
         decode_tp=2,
         cache_pool=pool,
-        lookup_rpc_port=19001,
         prefill_tps=[4],
     )
     assert cfg["kv_connector"] == "MultiConnector"
@@ -232,7 +232,7 @@ def test_gpu_multiconnector_prefill():
     assert "engine_id" not in p2p
     assert store["kv_connector"] == "MooncakeStoreConnector"
     assert store["kv_role"] == "kv_both"
-    assert store["kv_connector_extra_config"]["lookup_rpc_port"] == 19001
+    assert store["kv_connector_extra_config"]["lookup_rpc_port"] == "e0"
     assert store["kv_connector_extra_config"]["store_tp_size"] == 4
     assert "enable_store_tp_lcm" not in store["kv_connector_extra_config"]
     assert "save_decode_cache" not in store["kv_connector_extra_config"]
@@ -251,7 +251,6 @@ def test_gpu_multiconnector_lcm_omits_store_tp_size():
         prefill_tp=4,
         decode_tp=2,
         cache_pool=pool,
-        lookup_rpc_port=19001,
         prefill_tps=[4, 2],
     )
     extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
@@ -273,7 +272,6 @@ def test_gpu_multiconnector_decode_save_decode_cache():
         prefill_tp=4,
         decode_tp=2,
         cache_pool=pool,
-        lookup_rpc_port=19002,
         prefill_tps=[4],
     )
     store = cfg["kv_connector_extra_config"]["connectors"][1]
@@ -294,7 +292,6 @@ def test_npu_multiconnector():
         prefill_tp=4,
         decode_tp=2,
         cache_pool=pool,
-        lookup_rpc_port=1,
         prefill_tps=[4],
     )
     p2p, store = cfg["kv_connector_extra_config"]["connectors"]
@@ -303,31 +300,31 @@ def test_npu_multiconnector():
     assert "kv_port" not in cfg
     assert store["kv_connector"] == "AscendStoreConnector"
     assert store["kv_role"] == "kv_producer"
-    assert store["kv_connector_extra_config"] == {"lookup_rpc_port": 1}
+    assert store["kv_connector_extra_config"] == {"lookup_rpc_port": "e0"}
     assert "store_tp_size" not in store["kv_connector_extra_config"]
 
 
-def _store_lookup(lookup_rpc_port):
+def _store_lookup(engine_id):
     pool = KVCachePoolConfig(enabled=True)
     return build_store_connector_config(
         role="prefill",
         is_npu=True,
         cache_pool=pool,
-        lookup_rpc_port=lookup_rpc_port,
+        engine_id=engine_id,
         prefill_tp=4,
         decode_tp=2,
         prefill_tps=[4],
     )["kv_connector_extra_config"]["lookup_rpc_port"]
 
 
-@pytest.mark.parametrize("value", ["eid-0", 0, "0"])
-def test_build_store_accepts_lookup_suffix(value):
+@pytest.mark.parametrize("value", ["eid-0", "abc"])
+def test_build_store_writes_engine_id_as_lookup(value):
     assert _store_lookup(value) == value
 
 
-@pytest.mark.parametrize("value", [None, "", True, -1, "-1"])
-def test_build_store_rejects_illegal_lookup(value):
-    with pytest.raises(ValueError, match="lookup_rpc_port"):
+@pytest.mark.parametrize("value", [None, "", True, 0, 19001])
+def test_build_store_rejects_non_engine_id_lookup(value):
+    with pytest.raises(ValueError, match="engine_id"):
         _store_lookup(value)
 
 
@@ -382,7 +379,6 @@ def test_kv_load_failure_policy_written():
         prefill_tp=4,
         decode_tp=4,
         cache_pool=pool,
-        lookup_rpc_port=9,
         prefill_tps=[4],
     )
     assert cfg["kv_load_failure_policy"] == "recompute"
@@ -402,7 +398,6 @@ def test_kv_load_failure_policy_omitted_by_default():
         prefill_tp=4,
         decode_tp=4,
         cache_pool=pool,
-        lookup_rpc_port=9,
         prefill_tps=[4],
     )
     assert "kv_load_failure_policy" not in cfg
@@ -436,12 +431,31 @@ def test_extra_config_overrides():
         prefill_tp=4,
         decode_tp=4,
         cache_pool=pool,
-        lookup_rpc_port=9,
         prefill_tps=[4],
     )
     extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
     assert extra["cache_prefix"] == "expA"
     assert extra["load_async"] is False
+    assert extra["lookup_rpc_port"] == "e0"
+
+
+def test_extra_config_cannot_override_lookup_rpc_port():
+    pool = KVCachePoolConfig(enabled=True, extra_config={"lookup_rpc_port": 19001})
+    cfg = build_kv_transfer_config(
+        role="prefill",
+        engine_id="e0",
+        kv_buffer_device="cuda",
+        transfer_backend="mooncake",
+        mooncake_protocol="nvlink",
+        use_ascend_mooncake_v1=False,
+        kv_port=None,
+        prefill_tp=4,
+        decode_tp=4,
+        cache_pool=pool,
+        prefill_tps=[4],
+    )
+    extra = cfg["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]
+    assert extra["lookup_rpc_port"] == "e0"
 
 
 def test_store_tp_rejects_not_divisible():
@@ -945,32 +959,7 @@ def test_spawn_injects_pool_env_and_omits_mooncake_master():
     assert kv["kv_connector_extra_config"]["connectors"][1]["kv_connector_extra_config"]["lookup_rpc_port"] == "eid-0"
 
 
-def test_spawn_uses_user_lookup_rpc_port():
-    replica = _make_spawn_replica(cache_pool={"enabled": True, "connector": {"lookup_rpc_port": 19001}})
-    _, _, remote_kwargs = _spawn(replica)
-    extra = remote_kwargs["disaggregation_kv_transfer_config"]["kv_connector_extra_config"]["connectors"][1][
-        "kv_connector_extra_config"
-    ]
-    assert extra["lookup_rpc_port"] == 19001
-
-
-def test_spawn_uses_user_lookup_rpc_port_string_and_zero():
-    replica = _make_spawn_replica(cache_pool={"enabled": True, "connector": {"lookup_rpc_port": "custom-lookup"}})
-    _, _, remote_kwargs = _spawn(replica)
-    extra = remote_kwargs["disaggregation_kv_transfer_config"]["kv_connector_extra_config"]["connectors"][1][
-        "kv_connector_extra_config"
-    ]
-    assert extra["lookup_rpc_port"] == "custom-lookup"
-
-    replica0 = _make_spawn_replica(cache_pool={"enabled": True, "connector": {"lookup_rpc_port": 0}})
-    _, _, remote_kwargs0 = _spawn(replica0)
-    extra0 = remote_kwargs0["disaggregation_kv_transfer_config"]["kv_connector_extra_config"]["connectors"][1][
-        "kv_connector_extra_config"
-    ]
-    assert extra0["lookup_rpc_port"] == 0
-
-
-def test_spawn_auto_lookup_uses_engine_id():
+def test_spawn_lookup_rpc_port_is_engine_id():
     replica = _make_spawn_replica()
     _, _, remote_kwargs = _spawn(replica)
     extra = remote_kwargs["disaggregation_kv_transfer_config"]["kv_connector_extra_config"]["connectors"][1][

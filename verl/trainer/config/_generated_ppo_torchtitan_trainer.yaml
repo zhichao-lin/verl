@@ -419,7 +419,7 @@ actor_rollout_ref:
         mode: embedded
         protocol: null
         metadata_server: P2PHANDSHAKE
-        global_segment_size: 80GB
+        global_segment_size: 4GB
         local_buffer_size: 4GB
         device_name: ''
         tenant_id: default
@@ -429,7 +429,6 @@ actor_rollout_ref:
         prefer_alloc_in_same_node: true
       connector:
         load_async: null
-        lookup_rpc_port: null
         lookup_async: false
         cache_prefix: ''
         save_decode_cache: false

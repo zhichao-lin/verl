@@ -22,7 +22,6 @@ __all__ = [
     "KVCachePoolMasterConfig",
     "KVCachePoolStoreConfig",
     "KVCachePoolConnectorConfig",
-    "parse_lookup_rpc_port",
 ]
 
 _ALLOWED_BACKENDS = ("mooncake", "memcache", "yuanrong")
@@ -34,29 +33,6 @@ def _coerce(value, cls):
     if isinstance(value, cls):
         return value
     return cls(**dict(value))
-
-
-def parse_lookup_rpc_port(value) -> int | str | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError(f"lookup_rpc_port must not be bool, got {value!r}")
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        try:
-            as_int = int(stripped, 10)
-        except ValueError:
-            return stripped
-        if as_int < 0:
-            raise ValueError(f"lookup_rpc_port must be a non-negative int, got {value!r}")
-        return stripped
-    if isinstance(value, int):
-        if value < 0:
-            raise ValueError(f"lookup_rpc_port must be a non-negative int, got {value!r}")
-        return value
-    raise ValueError(f"lookup_rpc_port must be a non-negative int or str, got {value!r}")
 
 
 @dataclass
@@ -83,7 +59,7 @@ class KVCachePoolStoreConfig(BaseConfig):
     mode: str = "embedded"
     protocol: Optional[str] = None
     metadata_server: str = "P2PHANDSHAKE"
-    global_segment_size: str = "80GB"
+    global_segment_size: str = "4GB"
     local_buffer_size: str = "4GB"
     device_name: str = ""
     tenant_id: str = "default"
@@ -98,7 +74,6 @@ class KVCachePoolConnectorConfig(BaseConfig):
     """Store sub-connector extra_config fields for MultiConnector."""
 
     load_async: Optional[bool] = None
-    lookup_rpc_port: Optional[int | str] = None
     lookup_async: bool = False
     cache_prefix: str = ""
     save_decode_cache: bool = False
@@ -110,9 +85,6 @@ class KVCachePoolConnectorConfig(BaseConfig):
     use_layerwise: bool = False
     prefill_pp_size: Optional[int] = None
     prefill_pp_layer_partition: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        parse_lookup_rpc_port(self.lookup_rpc_port)
 
 
 @dataclass

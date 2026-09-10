@@ -365,10 +365,10 @@ class RolloutConfig(BaseConfig):
                 )
             if not self.disaggregation.enabled:
                 raise ValueError("rollout.cache_pool.enabled=True requires rollout.disaggregation.enabled=True.")
-            if self.disaggregation.transfer_backend != "mooncake":
+            if self.disaggregation.transfer_backend not in ("mooncake", "nixl"):
                 raise ValueError(
-                    "rollout.cache_pool.enabled=True requires disaggregation.transfer_backend='mooncake'; "
-                    f"got {self.disaggregation.transfer_backend!r}."
+                    "rollout.cache_pool.enabled=True requires disaggregation.transfer_backend "
+                    f"in ('mooncake', 'nixl'); got {self.disaggregation.transfer_backend!r}."
                 )
             if not self.enable_prefix_caching:
                 raise ValueError("rollout.cache_pool.enabled=True requires enable_prefix_caching=True.")
