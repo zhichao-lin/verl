@@ -59,6 +59,7 @@ from verl.workers.rollout.utils import (
     qwen2_5_vl_dedup_image_tokens,
     run_uvicorn,
 )
+from verl.workers.rollout.vllm_rollout.kv_cache_pool import materialize_mooncake_config, p2p_connector_name
 from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -269,6 +270,7 @@ class vLLMHttpServer:
         )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        materialize_mooncake_config(self.config, os.environ)
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -764,8 +766,7 @@ class vLLMHttpServer:
         decode_peer_index, decode_peer = self._select_decode_peer(effective_routing_key, prompt_ids)
         assert self._pd_decode_selector is not None
         try:
-            connector = (self._disaggregation_kv_transfer_config or {}).get("kv_connector", "")
-            is_mooncake = connector == "MooncakeConnector"
+            is_mooncake = p2p_connector_name(self._disaggregation_kv_transfer_config or {}) == "MooncakeConnector"
 
             prefill_sp = dict(sampling_params)
             prefill_sp.pop("max_tokens", None)

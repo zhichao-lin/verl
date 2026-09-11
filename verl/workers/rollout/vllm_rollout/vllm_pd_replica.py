@@ -25,14 +25,19 @@ import os
 import uuid
 from collections.abc import Mapping
 from dataclasses import replace as _dc_replace
-from typing import Any, Optional
+from typing import Any
 
 import ray
 from ray.actor import ActorHandle
 
 from verl.utils.device import get_device_name, get_resource_name, is_torch_npu_available
-from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.net_utils import get_free_port_range, is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
+    build_kv_transfer_config,
+    mooncake_json_path,
+    validate_platform_cache_pool,
+)
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 logger = logging.getLogger(__file__)
@@ -146,6 +151,16 @@ class vLLMPDReplica(vLLMReplica):
             )
             transfer_backend = "mooncake"
 
+        pool = self.config.cache_pool
+        if pool.enabled:
+            self._validate_cache_pool_engine_kwargs(self.config)
+            validate_platform_cache_pool(cache_pool=pool, is_npu=use_ascend_mooncake_v1)
+            if transfer_backend != "mooncake":
+                raise ValueError(
+                    "cache_pool.enabled=True requires transfer_backend='mooncake' "
+                    f"after NPU nixl remap; got {transfer_backend!r}."
+                )
+
         worker_infos = await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
@@ -167,18 +182,19 @@ class vLLMPDReplica(vLLMReplica):
         prefill_devs = self._collect_cuda_devices(worker_infos[:prefill_end])
 
         reserved_socks = []
-        prefill_side_channel_port, prefill_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-        reserved_socks.append(prefill_sock)
+        span_p = self._kv_handshake_port_span(
+            use_ascend_mooncake_v1=use_ascend_mooncake_v1, tp=self._prefill_tp
+        )
+        prefill_side_channel_port = self._reserve_handshake_ports(
+            prefill_host_ip, span_p, reserved_socks
+        )
         try:
             prefill_kv_cfg = self._build_kv_transfer_config(
                 role="prefill",
                 engine_id=prefill_engine_id,
                 transfer_backend=transfer_backend,
-                mooncake_protocol=self.config.disaggregation.mooncake_protocol,
                 use_ascend_mooncake_v1=use_ascend_mooncake_v1,
                 kv_port=prefill_side_channel_port,
-                prefill_tp=self._prefill_tp,
-                decode_tp=self._decode_tp,
             )
             self._prefill_servers = [
                 self._spawn_pd_server(
@@ -204,17 +220,19 @@ class vLLMPDReplica(vLLMReplica):
                 node_id_i = worker_infos[start][0]
                 devs_i = self._collect_cuda_devices(worker_infos[start:end])
 
-                decode_side_channel_port, decode_sock = get_free_port(prefill_host_ip, with_alive_sock=True)
-                reserved_socks.append(decode_sock)
+                span_d = self._kv_handshake_port_span(
+                    use_ascend_mooncake_v1=use_ascend_mooncake_v1, tp=self._decode_tp
+                )
+                decode_side_channel_port = self._reserve_handshake_ports(
+                    prefill_host_ip, span_d, reserved_socks
+                )
+                decode_engine_id = uuid.uuid4().hex
                 decode_kv_cfg = self._build_kv_transfer_config(
                     role="decode",
-                    engine_id=uuid.uuid4().hex,
+                    engine_id=decode_engine_id,
                     transfer_backend=transfer_backend,
-                    mooncake_protocol=self.config.disaggregation.mooncake_protocol,
                     use_ascend_mooncake_v1=use_ascend_mooncake_v1,
                     kv_port=decode_side_channel_port,
-                    prefill_tp=self._prefill_tp,
-                    decode_tp=self._decode_tp,
                 )
                 self._decode_servers.append(
                     self._spawn_pd_server(
@@ -316,53 +334,53 @@ class vLLMPDReplica(vLLMReplica):
         return is_torch_npu_available(check_device=False)
 
     @staticmethod
+    def _kv_handshake_port_span(*, use_ascend_mooncake_v1: bool, tp: int) -> int:
+        if tp < 1:
+            raise ValueError(f"tp must be >= 1, got {tp}")
+        return tp if use_ascend_mooncake_v1 else 1
+
+    @staticmethod
+    def _reserve_handshake_ports(host, span, reserved_socks):
+        port, socks = get_free_port_range(host, span, with_alive_socks=True)
+        reserved_socks.extend(socks)
+        return port
+
+    @staticmethod
     def _collect_cuda_devices(worker_infos) -> str:
         return ",".join(worker_info[1] for worker_info in worker_infos)
 
     @staticmethod
+    def _validate_cache_pool_engine_kwargs(config: RolloutConfig) -> None:
+        vllm_kwargs = (config.engine_kwargs or {}).get("vllm") or {}
+        if vllm_kwargs.get("kv_transfer_config"):
+            raise ValueError("engine_kwargs.vllm.kv_transfer_config")
+
     def _build_kv_transfer_config(
+        self,
+        *,
         role: str,
         engine_id: str,
         transfer_backend: str,
-        mooncake_protocol: Optional[str] = None,
-        use_ascend_mooncake_v1: bool = False,
-        kv_port: Optional[int] = None,
-        prefill_tp: Optional[int] = None,
-        decode_tp: Optional[int] = None,
+        use_ascend_mooncake_v1: bool,
+        kv_port: int,
     ) -> dict:
-        """Assemble vLLM's ``--kv-transfer-config`` payload."""
-        role_to_kv_role = {
-            "prefill": "kv_producer",
-            "decode": "kv_consumer",
-        }
+        """Assemble vLLM's ``--kv-transfer-config`` payload for one P/D server."""
         if use_ascend_mooncake_v1:
             if transfer_backend != "mooncake":
                 raise ValueError("Ascend PD requires transfer_backend='mooncake'")
-            if kv_port is None or prefill_tp is None or decode_tp is None:
-                raise ValueError(
-                    "MooncakeConnectorV1 requires kv_port, prefill_tp, and decode_tp"
-                )
-            connector = "MooncakeConnectorV1"
-        else:
-            connector = {
-                "nixl": "NixlConnector",
-                "mooncake": "MooncakeConnector",
-            }[transfer_backend]
-        cfg: dict = {
-            "kv_connector": connector,
-            "kv_role": role_to_kv_role[role],
-            "engine_id": engine_id,
-            "kv_buffer_device": get_device_name(),
-        }
-        if use_ascend_mooncake_v1:
-            cfg["kv_port"] = kv_port
-            cfg["kv_connector_extra_config"] = {
-                "prefill": {"dp_size": 1, "tp_size": prefill_tp},
-                "decode": {"dp_size": 1, "tp_size": decode_tp},
-            }
-        elif transfer_backend == "mooncake" and mooncake_protocol:
-            cfg["kv_connector_extra_config"] = {"mooncake_protocol": mooncake_protocol}
-        return cfg
+        return build_kv_transfer_config(
+            role=role,
+            engine_id=engine_id,
+            kv_buffer_device=get_device_name(),
+            transfer_backend=transfer_backend,
+            mooncake_protocol=self.config.disaggregation.mooncake_protocol,
+            use_ascend_mooncake_v1=use_ascend_mooncake_v1,
+            kv_port=kv_port,
+            prefill_tp=self._prefill_tp,
+            decode_tp=self._decode_tp,
+            cache_pool=self.config.cache_pool,
+            prefill_tps=[self._prefill_tp],
+        )
 
     def _build_pd_role_config(self, role: str, tp: int) -> RolloutConfig:
         """Apply role-local vLLM settings without mutating the shared config."""
@@ -411,6 +429,8 @@ class vLLMPDReplica(vLLMReplica):
     ) -> ActorHandle:
         """Construct one PD ``vLLMHttpServer`` actor."""
         per_role_config = self._build_pd_role_config(role, tp)
+        pool = self.config.cache_pool
+        job_id = ray.get_runtime_context().get_job_id()
 
         env_vars = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
@@ -422,8 +442,11 @@ class vLLMPDReplica(vLLMReplica):
             # Avoid Mooncake TCP port exhaustion under validation concurrency.
             "MC_TCP_ENABLE_CONNECTION_POOL": os.environ.get("MC_TCP_ENABLE_CONNECTION_POOL", "1"),
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
-            "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
+            "VERL_RAY_JOB_ID": job_id,
         }
+        if pool.enabled:
+            env_vars["PYTHONHASHSEED"] = str(pool.python_hash_seed)
+            env_vars["MOONCAKE_CONFIG_PATH"] = pool.store.config_path or mooncake_json_path(job_id)
 
         return self.server_class.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
