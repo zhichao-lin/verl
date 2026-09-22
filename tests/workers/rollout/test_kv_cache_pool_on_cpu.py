@@ -650,6 +650,13 @@ def test_actor_del_calls_stop():
     actor._proc.stop.assert_called()
 
 
+def test_actor_del_on_actor_class_is_noop():
+    """ray.remote() wraps the class; driver GC of ActorClass has no _proc."""
+    MooncakeMasterActor.__del__(MooncakeMasterActor)
+    fake_cls = type("ActorClass(MooncakeMasterActor)", (), {})()
+    MooncakeMasterActor.__del__(fake_cls)
+
+
 _DRIVER_NODE_ID = "a" * 56
 _MASTER_ADDRESS = "10.0.0.1:50051"
 

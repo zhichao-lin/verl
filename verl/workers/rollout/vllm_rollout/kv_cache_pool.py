@@ -577,10 +577,18 @@ class MooncakeMasterActor:
         return self._address
 
     def stop(self) -> None:
-        self._proc.stop()
+        proc = getattr(self, "_proc", None)
+        if proc is not None:
+            proc.stop()
 
     def __del__(self) -> None:
-        self.stop()
+        proc = getattr(self, "_proc", None)
+        if proc is None:
+            return
+        try:
+            proc.stop()
+        except Exception:
+            pass
 
 
 def setup_kv_cache_pool(rollout_cfg) -> None:
