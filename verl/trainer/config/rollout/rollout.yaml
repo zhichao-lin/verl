@@ -517,24 +517,23 @@ disaggregation:
   # InfiniBand device (required for mooncake over RDMA).
   ib_device: null
 
-# KV Cache Pool via MultiConnector (vLLM PD only).
+# KV Cache Pool. PD builds MultiConnector (P2P + Store). Non-PD builds one Store connector.
 cache_pool:
 
-  # Master switch. Requires rollout.name=vllm, disaggregation.enabled=true,
-  # transfer_backend=mooncake (NPU nixl is remapped), and enable_prefix_caching=true.
+  # Master switch. Requires rollout.name=vllm and enable_prefix_caching=true.
   enabled: False
 
   # NPU AscendStoreConnector backend. Options: mooncake, memcache, yuanrong.
   # Only mooncake is implemented.
   backend: mooncake
 
-  # Injected as PYTHONHASHSEED on every P/D server.
+  # Injected as PYTHONHASHSEED on every vLLM server that attaches the pool.
   python_hash_seed: 0
 
-  # MultiConnector top-level kv_load_failure_policy. null = omit (vLLM default fail).
+  # Top-level kv_load_failure_policy. null = omit (vLLM default fail).
   kv_load_failure_policy: null
 
-  # Merged into the Store child connector extra after first-class fields.
+  # Merged into the Store connector extra after first-class fields.
   extra_config: {}
 
   # mooncake_master lifecycle.
@@ -623,29 +622,31 @@ cache_pool:
     # GPU. Written only when non-empty.
     cache_prefix: ""
 
-    # GPU decode. Written only when true.
+    # GPU PD decode. Written only when true. Non-PD rejects true.
     save_decode_cache: False
 
-    # GPU. null = lcm(prefill_tp, decode_tp). Written only in store_tp_size mode.
+    # GPU. PD null = lcm(prefill_tp, decode_tp). Non-PD null = tensor_model_parallel_size.
     store_tp_size: null
 
-    # GPU. Mutually exclusive with store_tp_size. null = auto-on when prefill TPs differ.
+    # GPU PD. Mutually exclusive with store_tp_size. null = auto-on when prefill TPs differ.
+    # Non-PD rejects true.
     enable_store_tp_lcm: null
 
-    # GPU. Required in LCM mode. null = use runtime prefill TPs.
+    # GPU PD. Required in LCM mode. null = use runtime prefill TPs. Non-PD rejects a non-empty list.
     prefill_tp_sizes: null
 
-    # NPU. Written only when true.
+    # NPU PD decode. Written only when true. Non-PD rejects true.
     consumer_is_to_put: False
 
-    # NPU. Written only when true.
+    # NPU PD decode. Written only when true. Non-PD rejects true.
     consumer_is_to_load: False
 
-    # NPU memcache-only. Rejected with backend=mooncake.
+    # NPU memcache prefill only. Not a GPU MooncakeStoreConnector field.
+    # Rejected unless backend=memcache.
     use_layerwise: False
 
-    # NPU PP. Written only when non-null. PD still rejects PP>1.
+    # NPU PD PP. Written only when non-null. Non-PD rejects a value. PD still rejects PP>1.
     prefill_pp_size: null
 
-    # NPU PP partition string. Written only when non-null.
+    # NPU PD PP partition string. Written only when non-null. Non-PD rejects a value.
     prefill_pp_layer_partition: null

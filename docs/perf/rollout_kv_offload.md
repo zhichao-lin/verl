@@ -9,17 +9,49 @@ get deduplicated across requests and rollout replicas. This also helps
 long-tail load balancing: when work migrates to idle rollout replicas, shared
 prefix KV reduces the re-prefill cost.
 
-There are two mutually exclusive ways to enable this in verl:
+There are two first-class ways to enable this in verl. Both set
+`rollout.cache_pool.enabled=true` and are mutually exclusive with
+`engine_kwargs.vllm.kv_transfer_config`:
 
-- **Non-PD (colocated)**: pass `MooncakeStoreConnector` through
-  `engine_kwargs.vllm.kv_transfer_config`.
-- **PD disaggregation**: set `rollout.cache_pool.enabled=true` so verl builds a
+- **Non-PD (colocated)**: `disaggregation.enabled=false`. verl attaches one
+  Store connector, `kv_role=kv_both`. GPU uses `MooncakeStoreConnector`. NPU
+  uses `AscendStoreConnector` (`MooncakeBackend`).
+- **PD disaggregation**: `disaggregation.enabled=true`. verl builds a
   `MultiConnector` of P2P + Store.
 
-Do not enable both. PD replica-generated `kv_transfer_config` overwrites the
-engine-kwargs bypass.
+`cache_pool.enabled=false` still forwards a hand-written
+`engine_kwargs.vllm.kv_transfer_config`. Do not set that field when
+`cache_pool.enabled=true`.
 
 ## Non-PD (colocated) offload
+
+Requires `rollout.name=vllm`, `disaggregation.enabled=false`, and
+`enable_prefix_caching=true`. `transfer_backend` is ignored.
+
+verl starts or reuses one `mooncake_master` per Ray job, writes the Mooncake
+JSON, and injects `MOONCAKE_CONFIG_PATH` plus `PYTHONHASHSEED` on each actor
+rollout replica. Reward and teacher replicas raise `ValueError` if `cache_pool.enabled=true`.
+
+GPU `store_tp_size` defaults to `tensor_model_parallel_size`. PD-only fields
+(`save_decode_cache`, `enable_store_tp_lcm`, `prefill_tp_sizes`,
+`consumer_is_to_put`, `consumer_is_to_load`, `prefill_pp_size`,
+`prefill_pp_layer_partition`) are rejected. `use_layerwise` is an NPU memcache
+prefill field and is rejected unless `backend=memcache`.
+
+```yaml
+actor_rollout_ref.rollout:
+  name: vllm
+  tensor_model_parallel_size: 4
+  enable_prefix_caching: true
+  disaggregation:
+    enabled: false
+  cache_pool:
+    enabled: true
+    store:
+      global_segment_size: 4GB
+```
+
+### Manual connector bypass
 
 **Mutually exclusive with `rollout.cache_pool.enabled=true`.**
 
@@ -146,10 +178,12 @@ NPU so `mooncake_master` is on `PATH` when `auto_start=true`.
 verl clears both local and Mooncake KV caches at every weight update boundary
 to avoid reusing KV from the previous policy.
 
-On the PD + `cache_pool` path this is the existing
-`reset_prefix_cache(reset_connector=True)` on each P/D `vLLMHttpServer`
+On both the non-PD and PD + `cache_pool` paths this is the existing
+`reset_prefix_cache(reset_connector=True)` on each `vLLMHttpServer`
 (wake / sleep / clear / abort). verl does not flush `mooncake_master`
-separately.
+separately. `STANDALONE` mode skips `wake_up` / `sleep`; a weight update
+there still has to go through `clear_kv_cache()` or
+`pause_generation(clear_cache=True)`.
 
 **Required vLLM version**: use vLLM 0.22 or newer. Older builds may leave stale
 KV in the Mooncake master after a weight update.

@@ -363,12 +363,35 @@ class RolloutConfig(BaseConfig):
                 raise ValueError(
                     f"rollout.cache_pool.enabled=True requires rollout.name='vllm'; got {self.name!r}."
                 )
-            if not self.disaggregation.enabled:
-                raise ValueError("rollout.cache_pool.enabled=True requires rollout.disaggregation.enabled=True.")
-            if self.disaggregation.transfer_backend not in ("mooncake", "nixl"):
-                raise ValueError(
-                    "rollout.cache_pool.enabled=True requires disaggregation.transfer_backend "
-                    f"in ('mooncake', 'nixl'); got {self.disaggregation.transfer_backend!r}."
-                )
             if not self.enable_prefix_caching:
                 raise ValueError("rollout.cache_pool.enabled=True requires enable_prefix_caching=True.")
+            if self.disaggregation.enabled:
+                if self.disaggregation.transfer_backend not in ("mooncake", "nixl"):
+                    raise ValueError(
+                        "rollout.cache_pool.enabled=True requires disaggregation.transfer_backend "
+                        f"in ('mooncake', 'nixl'); got {self.disaggregation.transfer_backend!r}."
+                    )
+            else:
+                connector = self.cache_pool.connector
+                if connector.enable_store_tp_lcm is True:
+                    raise ValueError(
+                        "cache_pool.connector.enable_store_tp_lcm requires rollout.disaggregation.enabled=True"
+                    )
+                if connector.prefill_tp_sizes:
+                    raise ValueError(
+                        "cache_pool.connector.prefill_tp_sizes requires rollout.disaggregation.enabled=True"
+                    )
+                if connector.save_decode_cache:
+                    raise ValueError(
+                        "cache_pool.connector.save_decode_cache requires rollout.disaggregation.enabled=True"
+                    )
+                if connector.consumer_is_to_put or connector.consumer_is_to_load:
+                    raise ValueError(
+                        "cache_pool.connector.consumer_is_to_put/consumer_is_to_load require "
+                        "rollout.disaggregation.enabled=True"
+                    )
+                if connector.prefill_pp_size is not None or connector.prefill_pp_layer_partition is not None:
+                    raise ValueError(
+                        "cache_pool.connector.prefill_pp_size/prefill_pp_layer_partition require "
+                        "rollout.disaggregation.enabled=True"
+                    )

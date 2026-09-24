@@ -1,7 +1,7 @@
 # verl vLLM 后端 KV Cache Pool 方案讲解
 
-日期：2026-09-11  
-范围：如何让 **vLLM PD（Prefill/Decode 分离）** 同时拥有 P2P KV 传输和共享 KV Cache Pool。
+日期：2026-09-24  
+范围：vLLM 开 `cache_pool` 后怎么挂共享 KV Cache Pool。PD 是 P2P + Store；非 PD 只有一个 Store。
 
 配套文档：
 
@@ -11,16 +11,17 @@
 
 ## 1. 一句话先讲清楚
 
-开启 `cache_pool` 后，verl 不再只给 vLLM 配一个 P2P 连接器，而是组装成：
+`cache_pool.enabled=true` 有两种组装，取决于是否开 PD：
 
 ```text
-MultiConnector = [P2P 连接器, Store 连接器]
+非 PD：一个扁平 Store 连接器，kv_role = kv_both
+PD：  MultiConnector = [P2P 连接器, Store 连接器]
 ```
 
-- **P2P**：这次请求的 Prefill 实例把刚算出的 KV 直接传给 Decode 实例。
-- **Store（Pool）**：同一 Ray Job 里所有 P/D 实例共享一块 Mooncake 存储。公共前缀（系统提示、工具历史、`rollout.n` 多样本）命中后，不必反复 prefill。
+- **P2P**（仅 PD）：这次请求的 Prefill 实例把刚算出的 KV 直接传给 Decode 实例。
+- **Store（Pool）**：同一 Ray Job 里挂上 Pool 的 vLLM 实例共享一块 Mooncake 存储。公共前缀（系统提示、工具历史、`rollout.n` 多样本）命中后，不必反复 prefill。
 
-GPU 和 NPU 走同一套 verl 编排，但 **P2P / Store 的上游类名、JSON 字段、握手端口、PD 调度协议都不同**。
+GPU 和 NPU 走同一套 verl 编排，但 **P2P / Store 的上游类名、JSON 字段、握手端口、PD 调度协议都不同**。非 PD 只用 Store 这一列。
 
 | 平台 | P2P | Store |
 |---|---|---|
@@ -29,42 +30,44 @@ GPU 和 NPU 走同一套 verl 编排，但 **P2P / Store 的上游类名、JSON 
 
 ---
 
-## 2. 为什么非 PD 旁路不够用
+## 2. 两条路径
 
-非 PD（P/D 同机）本来就可以通过 `engine_kwargs.vllm.kv_transfer_config` 把 `MooncakeStoreConnector` 塞给 vLLM。  
-PD 打开后，`vLLMPDReplica` 会自己生成 `kv_transfer_config`，把这条旁路覆盖掉。结果是：
+`cache_pool.enabled=true` 覆盖 PD 和非 PD。`engine_kwargs.vllm.kv_transfer_config` 与 Pool 互斥，启动时非空直接 `ValueError`。`cache_pool.enabled=false` 时仍可走这条手写旁路。
 
-- 关 PD：可以有 Store，没有 P2P。
-- 开 PD、关 Pool：可以有 P2P，没有 Store。
-- 开 PD、开 Pool：必须用 MultiConnector，两边都要。
-
-两条路径互斥。PD 启动时如果发现 `engine_kwargs.vllm.kv_transfer_config` 非空，直接 `ValueError`。
+- 关 PD、开 Pool：单个 Store 连接器，`kv_role=kv_both`。GPU 是 `MooncakeStoreConnector`，NPU 是 `AscendStoreConnector`。没有 P2P，请求不进 `_pd_dispatch`。
+- 开 PD、关 Pool：只有 P2P。
+- 开 PD、开 Pool：`MultiConnector = [P2P, Store]`。
 
 开启条件（配置期校验）：
 
 - `rollout.name=vllm`
-- `disaggregation.enabled=true`
 - `enable_prefix_caching=true`
-- `transfer_backend` 属于 `mooncake` 或 `nixl`（NPU 上 `nixl` 会 remap 成 mooncake；GPU 上 `nixl + pool` 仍拒绝）
+- PD 额外要求 `disaggregation.enabled=true`，且 `transfer_backend` 属于 `mooncake` 或 `nixl`（NPU 上 `nixl` 会 remap 成 mooncake；GPU 上 `nixl + pool` 仍拒绝）
+- 非 PD 忽略 `transfer_backend`。配置期只拒绝这些「打开」的值：`enable_store_tp_lcm=true`、非空 `prefill_tp_sizes`、`save_decode_cache=true`、`consumer_is_to_put=true`、`consumer_is_to_load=true`、非空 `prefill_pp_size` / `prefill_pp_layer_partition`。`enable_store_tp_lcm=false` 和空列表 `prefill_tp_sizes` 在配置期不拒绝。NPU 启动期仍要求 GPU 专用字段保持默认（`enable_store_tp_lcm` 默认是 `null`，`false` 会报 not supported on this platform）。`use_layerwise` 只属于 NPU memcache 的 Prefill，`backend` 不是 `memcache` 时拒绝；`backend=memcache` 随后因未实现而 `NotImplementedError`。GPU 的 `MooncakeStoreConnector` 没有 `use_layerwise`。
 
 ---
 
 ## 3. 模块怎么切
 
-职责刻意拆开，replica 不再自己拼 MultiConnector 字典。
+职责刻意拆开，replica 不再自己拼连接器字典。PD 走 MultiConnector，非 PD 走扁平 Store。
 
 ```mermaid
 flowchart TB
     CFG["KVCachePoolConfig<br/>cache_pool.py"] --> MGR["LLMServerManager.create()"]
     MGR --> SETUP["setup_kv_cache_pool()<br/>拉起或复用 mooncake_master"]
-    SETUP --> REPL["vLLMPDReplica.launch_servers()"]
-    REPL --> VAL["平台校验 + 禁止双源 kv_transfer_config"]
-    VAL --> BUILD["build_kv_transfer_config()<br/>纯函数"]
-    BUILD --> P2P["build_p2p_connector_config()"]
-    BUILD --> STORE["build_store_connector_config()"]
+    SETUP --> BRANCH{"disaggregation.enabled?"}
+    BRANCH -->|true| PD["vLLMPDReplica.launch_servers()"]
+    BRANCH -->|false| NPD["vLLMReplica._prepare_non_pd_kv_transfer()"]
+    PD --> VAL["平台校验 + 禁止双源 kv_transfer_config"]
+    NPD --> NVAL["平台校验 + 禁止双源<br/>reward/teacher 且 enabled 则报错"]
+    VAL --> BUILD["build_pd_kv_transfer_config()"]
+    BUILD --> P2P["build_pd_p2p_connector_config()"]
+    BUILD --> STORE["build_pd_store_connector_config()"]
     BUILD --> SPAWN["_spawn_pd_server()"]
+    NVAL --> NBUILD["build_non_pd_kv_transfer_config()<br/>扁平 Store, kv_both"]
     SPAWN --> ENV["注入 MOONCAKE_CONFIG_PATH<br/>PYTHONHASHSEED"]
-    SPAWN --> HTTP["vLLMHttpServer.launch_server()"]
+    NBUILD --> ENV
+    ENV --> HTTP["vLLMHttpServer.launch_server()"]
     HTTP --> JSON["materialize_mooncake_config()<br/>本地写 JSON"]
     HTTP --> VLLM["vllm serve"]
 ```
@@ -72,17 +75,20 @@ flowchart TB
 | 单元 | 文件 | 干什么 |
 |---|---|---|
 | 配置 | `verl/workers/config/cache_pool.py` | Hydra 字段、平台无关校验 |
-| 接入 | `verl/workers/config/rollout.py` | `RolloutConfig.cache_pool`，要求 vLLM + PD + prefix cache |
-| 纯函数 + master | `verl/workers/rollout/vllm_rollout/kv_cache_pool.py` | JSON、Store TP、MultiConnector、`MooncakeMasterActor` |
+| 接入 | `verl/workers/config/rollout.py` | `RolloutConfig.cache_pool`。vLLM + prefix cache；PD 再要求 disaggregation |
+| 纯函数 + master | `verl/workers/rollout/vllm_rollout/kv_cache_pool.py` | JSON、Store TP、MultiConnector、非 PD 的单个 Store、`MooncakeMasterActor` |
 | Job 入口 | `verl/workers/rollout/llm_server.py` | `create()` 里先 `setup_kv_cache_pool()`，再起 replica |
-| PD replica | `verl/workers/rollout/vllm_rollout/vllm_pd_replica.py` | 平台探测、端口、env、调用组装函数 |
-| HTTP server | `verl/workers/rollout/vllm_rollout/vllm_async_server.py` | 落盘 JSON；`_pd_dispatch` 按 P2P 名字分支 |
+| PD replica | `verl/workers/rollout/vllm_rollout/vllm_pd_replica.py` | 平台探测、端口、env、调用 MultiConnector |
+| 非 PD replica | `verl/workers/rollout/vllm_rollout/vllm_async_server.py` 的 `vLLMReplica` | `build_non_pd_kv_transfer_config()`。reward/teacher 打开 Pool 直接 `ValueError` |
+| HTTP server | 同文件 `vLLMHttpServer` | 落盘 JSON；PD 走 `_pd_dispatch`，非 PD 把扁平 Store 配置写入 `vllm serve` |
 
 ---
 
 ## 4. 启动时序
 
-一次 `ray.init()` 之后的同一个 driver（`get_job_id()`）共享 **一个** Mooncake Store 和 **一个** `mooncake_master`。这与是否 `ray job submit` 无关：`python -m verl.trainer.main_ppo` 同样有 JobID。
+一次 `ray.init()` 之后的同一个 driver（`get_job_id()`）共享 **一个** Mooncake Store 和 **一个** `mooncake_master`。这与是否 `ray job submit` 无关：`python -m verl.trainer.main_ppo` 同样有 JobID。PD 和非 PD 都先走 `setup_kv_cache_pool()`，后面分叉。
+
+### 4.1 PD
 
 ```mermaid
 sequenceDiagram
@@ -126,20 +132,50 @@ sequenceDiagram
 2. Actor 名固定 `verl_mooncake_master_{job_id}`。同 driver 多次 `create()` 复用，不新起进程。
 3. JSON 按节点本地落盘：`{tempdir}/verl_mooncake_{job_id}.json`。不依赖 NFS。只写 `master_server_address`，不注入 `MOONCAKE_MASTER`。
 4. 用户给了 `store.config_path` 时不生成 JSON；此时 `auto_start` 必须是 false。
-5. 每个 P/D 进程额外注入 `PYTHONHASHSEED`（默认 `0`），保证 Store key 哈希一致。
+5. 每个挂上 Pool 的 vLLM 进程额外注入 `PYTHONHASHSEED`（默认 `0`），保证 Store key 哈希一致。PD 是每个 P/D 进程；非 PD 是每个 actor rollout replica。Reward / teacher 的 rollout 若 `cache_pool.enabled=true`，在组连接器之前 `ValueError`，不会去写 JSON。
+
+### 4.2 非 PD
+
+`disaggregation.enabled=false` 时 `get_rollout_replica_class` 选出 `vLLMReplica`，不进 `vLLMPDReplica`。
+
+```mermaid
+sequenceDiagram
+    participant Driver as LLMServerManager
+    participant Actor0 as MooncakeMasterActor
+    participant Replica as vLLMReplica
+    participant HTTP as vLLMHttpServer
+
+    Driver->>Driver: setup_kv_cache_pool()
+    Driver->>Replica: _initialize_llm_servers()
+    Replica->>Replica: _prepare_non_pd_kv_transfer()
+    alt reward 或 teacher，且 cache_pool 打开
+        Replica-->>Replica: ValueError，不起 vLLM
+    else cache_pool 关闭
+        Replica->>HTTP: 不传 kv_transfer_config，不注入 Pool env
+        HTTP->>HTTP: materialize 直接返回，然后 vllm serve
+    else actor rollout
+        Replica->>Replica: build_non_pd_kv_transfer_config()
+        Replica->>HTTP: 扁平 Store + MOONCAKE_CONFIG_PATH + PYTHONHASHSEED
+        HTTP->>HTTP: materialize_mooncake_config()
+        HTTP->>HTTP: vllm serve，请求不进 _pd_dispatch
+    end
+```
+
+同一 replica 的各个节点共用一份 `engine_id`。`lookup_rpc_port` 写成这个 `engine_id`。一个 replica 只有 node 0 接请求，其余节点是同一套引擎的 worker。
 
 ---
 
-## 5. MultiConnector 长什么样
+## 5. kv_transfer_config 长什么样
 
-关 Pool：把 P2P 字段展平到顶层，形状与旧 PD 单连接器一致（含 NIXL）。  
-开 Pool：顶层一定是 `MultiConnector`，`connectors` 顺序固定 `[P2P, Store]`。NIXL **不会**进入 MultiConnector。
+关 Pool 的 PD：把 P2P 字段展平到顶层，形状与旧 PD 单连接器一致（含 NIXL）。  
+开 Pool 的 PD：顶层是 `MultiConnector`，`connectors` 顺序固定 `[P2P, Store]`。NIXL **不会**进入 MultiConnector。  
+开 Pool 的非 PD：顶层就是 Store 连接器，没有 `connectors`，`kv_role=kv_both`。
 
-`engine_id` 和 `kv_buffer_device` 只写在顶层，不复制进子连接器。verl 的 `set_pd_peer` / `_pd_dispatch` 需要它们。
+PD 开 Pool 时，`engine_id` 和 `kv_buffer_device` 只写在顶层，不复制进子连接器。verl 的 `set_pd_peer` / `_pd_dispatch` 需要它们。下面这张图只描述这条 PD 路径：
 
 ```mermaid
 flowchart LR
-    subgraph Top["kv_transfer_config 顶层"]
+    subgraph Top["PD 开 Pool：kv_transfer_config 顶层"]
         C["kv_connector = MultiConnector"]
         R["kv_role = kv_producer | kv_consumer"]
         E["engine_id"]
@@ -152,9 +188,26 @@ flowchart LR
     Top --> Extra
 ```
 
-Prefill 的顶层 `kv_role` 是 `kv_producer`，Decode 是 `kv_consumer`。Store 子连接器自己的 `kv_role` 见下一节，GPU / NPU 不一样。
+PD Prefill 的顶层 `kv_role` 是 `kv_producer`，Decode 是 `kv_consumer`。Store 子连接器自己的 `kv_role` 见下一节，GPU / NPU 不一样。非 PD 没有这层拆分，顶层 `kv_role` 固定 `kv_both`。
 
-`lookup_rpc_port` 不是用户可配端口，**一律写成该实例的 `engine_id`**（UUID hex）。上游把它当 IPC 后缀用，用来区分同一节点上多个 vLLM 进程的 lookup 通道。
+非 PD GPU 写成：
+
+```json
+{
+  "kv_connector": "MooncakeStoreConnector",
+  "kv_role": "kv_both",
+  "engine_id": "<uuid hex>",
+  "kv_buffer_device": "cuda",
+  "kv_connector_extra_config": {
+    "store_tp_size": 4,
+    "lookup_rpc_port": "<同一个 uuid hex>"
+  }
+}
+```
+
+非 PD NPU 不写 `store_tp_size`，连接器名是 `AscendStoreConnector`，`kv_buffer_device` 是 `npu`。
+
+`lookup_rpc_port` 不是用户可配端口，**一律写成该实例的 `engine_id`**（UUID hex）。上游把它当 IPC 后缀用，用来区分同一节点上多个 vLLM 进程的 lookup 通道。PD 写在 Store 子连接器里；非 PD 写在顶层 `kv_connector_extra_config` 里。`engine_id` 和 `kv_buffer_device` 都在顶层。
 
 ---
 
@@ -183,7 +236,7 @@ flowchart TB
     end
 ```
 
-GPU Prefill 的 Store 是 `kv_both`：既要把公共前缀写入 Pool，又要在命中时读出来。NPU 官方 PD 示例不这么拆，Store 角色跟 P2P 走。
+GPU Prefill 的 Store 是 `kv_both`：既要把公共前缀写入 Pool，又要在命中时读出来。NPU 官方 PD 示例不这么拆，Store 角色跟 P2P 走。非 PD 两端平台的 Store 都是 `kv_both`，因为同一个实例既写也读。
 
 ### 6.2 P2P 子连接器
 
@@ -237,12 +290,13 @@ NPU 用 `ssd_offload_path` 开 SSD，忽略 `enable_offload`。开 SSD 时自动
 
 ### 6.4 GPU 独有：Store TP
 
-非对称 TP 时（例如 Prefill TP=4、Decode TP=2），Store 里的 KV 布局需要一个能被两端整除的并行度。
+PD 非对称 TP 时（例如 Prefill TP=4、Decode TP=2），Store 里的 KV 布局需要一个能被两端整除的并行度。
 
-- 默认：`store_tp_size = lcm(prefill_tp, decode_tp)`
-- 用户显式给 `store_tp_size`：用该值，且禁止同时 `enable_store_tp_lcm=true`
-- 多个 Prefill 且 TP 不一致时：自动改走 LCM 模式，写入 `enable_store_tp_lcm=true` + `prefill_tp_sizes`，不再写 `store_tp_size`
-- 校验：对 Prefill TP 和 Decode TP 都要 `store_tp_size >= tp` 且能整除
+- PD 默认：`store_tp_size = lcm(prefill_tp, decode_tp)`
+- 非 PD 默认：`store_tp_size = tensor_model_parallel_size`。没有 Prefill/Decode 两端，不走 LCM
+- 用户显式给 `store_tp_size`：用该值。PD 上禁止同时 `enable_store_tp_lcm=true`。非 PD 要求 `store_tp_size >= tensor_model_parallel_size` 且能被它整除
+- 多个 Prefill 且 TP 不一致时（仅 PD）：自动改走 LCM 模式，写入 `enable_store_tp_lcm=true` + `prefill_tp_sizes`，不再写 `store_tp_size`
+- PD 校验：对 Prefill TP 和 Decode TP 都要 `store_tp_size >= tp` 且能整除
 
 NPU **不写** `store_tp_size`。非对称 TP 只出现在 NPU 的 P2P 子连接器 `prefill.tp_size` / `decode.tp_size`。
 
@@ -277,7 +331,9 @@ NPU 的 `backend` 字段预留了 `mooncake | memcache | yuanrong`，当前非 `
 
 ## 7. 一次请求怎么走
 
-`_pd_dispatch` 看的是 **P2P 名字**，不是顶层 `MultiConnector`：
+非 PD 的 `disaggregation_role` 是 `null`，`generate()` 不进 `_pd_dispatch`，由 vLLM 自己对这个 Store 连接器做 PUT / GET。
+
+PD 的 `_pd_dispatch` 看的是 **P2P 名字**，不是顶层 `MultiConnector`：
 
 1. 顶层是 `MultiConnector` → 取 `connectors[0].kv_connector`
 2. 否则用顶层 `kv_connector`
@@ -319,6 +375,43 @@ NPU V1 和（关 Pool 时的）NIXL 相反：必须用 prefill 返回的 params�
 
 Decode 路由仍然是 replica 内 radix / decode policy，**不用 Store 命中率做 cache-aware 调度**。
 
+### 7.1 非 PD
+
+非 PD 没有 Prefill / Decode 两种角色。`disaggregation.enabled=false` 时 replica 类是 `vLLMReplica`，每个 actor rollout replica 自己既写 Pool 又读 Pool。
+
+```mermaid
+sequenceDiagram
+    participant Client as AgentLoop
+    participant R as vLLM replica
+    participant Store as Mooncake Store
+
+    Client->>R: generate(request)
+    R->>Store: 前缀 GET（命中则跳过计算）
+    R->>R: 未命中的 token 在本机计算
+    R->>Store: 新算出的前缀 PUT
+    R-->>Client: 生成 token
+```
+
+和 PD 的差别：
+
+| | 非 PD | PD |
+|---|---|---|
+| 连接器 | 一个 Store，顶层 `kv_role=kv_both` | `MultiConnector = [P2P, Store]` |
+| 谁挂 Pool | actor rollout replica。Reward / teacher 打开 Pool 直接报错 | 每个 Prefill / Decode |
+| 请求路径 | 普通 `generate()`，不进 `_pd_dispatch` | Prefill 上 `_pd_dispatch`，再转到 Decode |
+| GPU `store_tp_size` | 默认 `tensor_model_parallel_size` | 默认 `lcm(prefill_tp, decode_tp)` |
+| `transfer_backend` | 忽略，没有 P2P，也不分配握手端口 | 必须是 `mooncake` 或 `nixl` |
+| 同一 replica 的 `engine_id` | 各节点共用一份，只有 node 0 接请求 | 每个 P/D server 各一份 |
+
+非 PD 仍会写的 Store 字段：`load_async`（非 null 才写）、GPU 的 `store_tp_size` / `lookup_async` / `cache_prefix`、`lookup_rpc_port`（等于该 replica 的 `engine_id`）、顶层 `kv_load_failure_policy`（非 null 才写）。NPU 不写 `store_tp_size`，也不写 `use_layerwise`。
+
+这些字段表达的是 PD 两端角色或 GPU Store TP，非 PD 不能拿来开功能：
+
+- 配置期（不区分平台）拒绝「打开」的值：`enable_store_tp_lcm=true`、非空 `prefill_tp_sizes`、`save_decode_cache=true`、`consumer_is_to_put=true`、`consumer_is_to_load=true`、非空 `prefill_pp_size` / `prefill_pp_layer_partition`。
+- NPU 启动期更严：`enable_store_tp_lcm` 和 `prefill_tp_sizes` 只要不是默认 `null` 就报 `not supported on this platform`，包括 `false` 和 `[]`。保持 YAML 默认 `null` 才通过。GPU 非 PD 会忽略 `false` 和 `[]`。
+
+Master、JSON、`PYTHONHASHSEED` 与 PD 共用第 4 节的同一套 `setup_kv_cache_pool()`。多个 rollout replica 因此共享一块 Pool。权重更新也走第 8 节的 `reset_prefix_cache(reset_connector=True)`，不因为没有 P2P 而少清 Store。
+
 ---
 
 ## 8. 权重更新时怎么保证正确性
@@ -334,6 +427,27 @@ wake / sleep / clear / abort 都会走到这里，本地 prefix cache 和 Store 
 ---
 
 ## 9. 最小配置示例
+
+### 9.1 非 PD
+
+GPU，TP=4，不开 SSD。`transfer_backend` 不用写，`store_tp_size` 默认等于 `tensor_model_parallel_size`：
+
+```yaml
+actor_rollout_ref.rollout:
+  name: vllm
+  tensor_model_parallel_size: 4
+  enable_prefix_caching: true
+  disaggregation:
+    enabled: false
+  cache_pool:
+    enabled: true
+    store:
+      global_segment_size: 4GB
+```
+
+NPU 同样把 `disaggregation.enabled` 保持 false。不要设 `enable_store_tp_lcm`、`prefill_tp_sizes`、`save_decode_cache`、`consumer_is_to_put`、`consumer_is_to_load`、`prefill_pp_size`、`prefill_pp_layer_partition`。SSD 仍用 `store.ssd_offload_path`，规则与 PD 相同。
+
+### 9.2 PD
 
 GPU，1 个 Prefill（TP=4）+ 3 个 Decode（TP=2），不开 SSD：
 
@@ -379,7 +493,7 @@ actor_rollout_ref.rollout:
 
 ## 10. 明确不做的事
 
-- 非 PD 纯 Store：继续走 `engine_kwargs` 旁路，与 PD Pool 互斥
+- 非 PD 包进 `MultiConnector`，或在非 PD 上挂 P2P。非 PD 只挂单个 Store；`cache_pool.enabled=false` 时的 `engine_kwargs` 旁路保留
 - GPU `standalone-store` / `mooncake_client` / GPU SSD / GPU `enable_offload`
 - NPU `memcache` / `yuanrong` 实现
 - 本阶段多 Prefill replica、PP > 1、跨节点单个 PD replica
@@ -394,6 +508,6 @@ actor_rollout_ref.rollout:
 1. `verl/workers/config/cache_pool.py` — 有哪些旋钮、什么时候在配置期失败  
 2. `verl/workers/rollout/vllm_rollout/kv_cache_pool.py` 里的 `build_*` — GPU/NPU 字典长什么样  
 3. 同文件的 `setup_kv_cache_pool` / `MooncakeMasterActor` — master 怎么起、怎么复用  
-4. `vllm_pd_replica.py` 的 `launch_servers` 组 `kv_transfer_config`，`_spawn_pd_server` 注入 env 并转发  
-5. `vllm_async_server.py` 的 `materialize_mooncake_config` 调用点和 `_pd_dispatch` — JSON 落盘与请求路径  
+4. `vllm_pd_replica.py` 的 `launch_servers` 组 PD 的 `kv_transfer_config`，`_spawn_pd_server` 注入 env 并转发  
+5. `vllm_async_server.py` 的 `vLLMReplica._prepare_non_pd_kv_transfer` — 非 PD 扁平 Store；`materialize_mooncake_config` 落盘；`_pd_dispatch` 只服务 PD  
 6. `tests/workers/rollout/test_kv_cache_pool_on_cpu.py` — 用断言当说明书

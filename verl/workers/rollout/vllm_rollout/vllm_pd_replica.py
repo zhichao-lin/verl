@@ -34,7 +34,7 @@ from verl.utils.device import get_device_name, get_resource_name, is_torch_npu_a
 from verl.utils.net_utils import get_free_port_range, is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
-    build_kv_transfer_config,
+    build_pd_kv_transfer_config,
     mooncake_json_path,
     validate_platform_cache_pool,
 )
@@ -378,7 +378,7 @@ class vLLMPDReplica(vLLMReplica):
         if use_ascend_mooncake_v1:
             if transfer_backend != "mooncake":
                 raise ValueError("Ascend PD requires transfer_backend='mooncake'")
-        return build_kv_transfer_config(
+        return build_pd_kv_transfer_config(
             role=role,
             engine_id=engine_id,
             kv_buffer_device=get_device_name(),

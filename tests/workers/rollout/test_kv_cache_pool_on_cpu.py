@@ -27,10 +27,11 @@ from verl.workers.config.cache_pool import KVCachePoolConfig, KVCachePoolMasterC
 from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
     MooncakeMasterActor,
     MooncakeMasterProcess,
-    build_kv_transfer_config,
+    build_pd_kv_transfer_config,
     build_mooncake_json,
     build_mooncake_master_cmd,
-    build_store_connector_config,
+    build_pd_store_connector_config,
+    build_non_pd_kv_transfer_config,
     materialize_mooncake_config,
     mooncake_json_path,
     p2p_connector_name,
@@ -209,7 +210,7 @@ def test_platform_gpu_rejects_npu_store_field():
 
 def test_gpu_multiconnector_prefill():
     pool = KVCachePoolConfig(enabled=True)
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -240,7 +241,7 @@ def test_gpu_multiconnector_prefill():
 
 def test_gpu_multiconnector_lcm_omits_store_tp_size():
     pool = KVCachePoolConfig(enabled=True)
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -261,7 +262,7 @@ def test_gpu_multiconnector_lcm_omits_store_tp_size():
 
 def test_gpu_multiconnector_decode_save_decode_cache():
     pool = KVCachePoolConfig(enabled=True, connector={"save_decode_cache": True})
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="decode",
         engine_id="e1",
         kv_buffer_device="cuda",
@@ -281,7 +282,7 @@ def test_gpu_multiconnector_decode_save_decode_cache():
 
 def test_npu_multiconnector():
     pool = KVCachePoolConfig(enabled=True)
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="npu",
@@ -306,7 +307,7 @@ def test_npu_multiconnector():
 
 def _store_lookup(engine_id):
     pool = KVCachePoolConfig(enabled=True)
-    return build_store_connector_config(
+    return build_pd_store_connector_config(
         role="prefill",
         is_npu=True,
         cache_pool=pool,
@@ -328,8 +329,83 @@ def test_build_store_rejects_non_engine_id_lookup(value):
         _store_lookup(value)
 
 
+def test_unified_gpu_store_connector():
+    pool = KVCachePoolConfig(enabled=True, connector={"store_tp_size": 8, "cache_prefix": "tenant"})
+    cfg = build_non_pd_kv_transfer_config(
+        is_npu=False,
+        cache_pool=pool,
+        engine_id="e0",
+        tp=4,
+        kv_buffer_device="cuda",
+    )
+    assert cfg["kv_connector"] == "MooncakeStoreConnector"
+    assert cfg["kv_role"] == "kv_both"
+    assert cfg["engine_id"] == "e0"
+    assert cfg["kv_buffer_device"] == "cuda"
+    extra = cfg["kv_connector_extra_config"]
+    assert extra["lookup_rpc_port"] == "e0"
+    assert extra["store_tp_size"] == 8
+    assert extra["cache_prefix"] == "tenant"
+    assert "connectors" not in extra
+    assert "use_layerwise" not in extra
+    assert "backend" not in extra
+    assert "save_decode_cache" not in extra
+
+
+def test_unified_gpu_store_tp_defaults_to_replica_tp():
+    pool = KVCachePoolConfig(enabled=True)
+    cfg = build_non_pd_kv_transfer_config(
+        is_npu=False,
+        cache_pool=pool,
+        engine_id="e0",
+        tp=4,
+        kv_buffer_device="cuda",
+    )
+    assert cfg["kv_connector_extra_config"]["store_tp_size"] == 4
+
+
+def test_unified_gpu_rejects_store_tp_not_divisible():
+    pool = KVCachePoolConfig(enabled=True, connector={"store_tp_size": 6})
+    with pytest.raises(ValueError, match="store_tp_size"):
+        build_non_pd_kv_transfer_config(
+            is_npu=False,
+            cache_pool=pool,
+            engine_id="e0",
+            tp=4,
+            kv_buffer_device="cuda",
+        )
+
+
+def test_unified_npu_store_connector():
+    pool = KVCachePoolConfig(enabled=True, kv_load_failure_policy="recompute")
+    cfg = build_non_pd_kv_transfer_config(
+        is_npu=True,
+        cache_pool=pool,
+        engine_id="e0",
+        tp=4,
+        kv_buffer_device="npu",
+    )
+    assert cfg["kv_connector"] == "AscendStoreConnector"
+    assert cfg["kv_role"] == "kv_both"
+    assert cfg["kv_buffer_device"] == "npu"
+    assert cfg["kv_load_failure_policy"] == "recompute"
+    assert cfg["kv_connector_extra_config"] == {"lookup_rpc_port": "e0"}
+
+
+def test_unified_rejects_empty_engine_id():
+    pool = KVCachePoolConfig(enabled=True)
+    with pytest.raises(ValueError, match="engine_id"):
+        build_non_pd_kv_transfer_config(
+            is_npu=False,
+            cache_pool=pool,
+            engine_id="",
+            tp=4,
+            kv_buffer_device="cuda",
+        )
+
+
 def test_pool_disabled_keeps_single_p2p():
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -348,7 +424,7 @@ def test_pool_disabled_keeps_single_p2p():
 
 
 def test_pool_disabled_nixl_single_connector():
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -368,7 +444,7 @@ def test_pool_disabled_nixl_single_connector():
 
 def test_kv_load_failure_policy_written():
     pool = KVCachePoolConfig(enabled=True, kv_load_failure_policy="recompute")
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -387,7 +463,7 @@ def test_kv_load_failure_policy_written():
 
 def test_kv_load_failure_policy_omitted_by_default():
     pool = KVCachePoolConfig(enabled=True)
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -420,7 +496,7 @@ def test_p2p_connector_name_missing_child():
 
 def test_extra_config_overrides():
     pool = KVCachePoolConfig(enabled=True, extra_config={"cache_prefix": "expA", "load_async": False})
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -441,7 +517,7 @@ def test_extra_config_overrides():
 
 def test_extra_config_cannot_override_lookup_rpc_port():
     pool = KVCachePoolConfig(enabled=True, extra_config={"lookup_rpc_port": 19001})
-    cfg = build_kv_transfer_config(
+    cfg = build_pd_kv_transfer_config(
         role="prefill",
         engine_id="e0",
         kv_buffer_device="cuda",
@@ -973,6 +1049,88 @@ def test_spawn_uses_user_config_path_for_env():
     )
     _, env_vars, _ = _spawn(replica)
     assert env_vars["MOONCAKE_CONFIG_PATH"] == "/tmp/user_mooncake.json"
+
+
+def _make_unified_replica(*, cache_pool=None, engine_kwargs=None, is_reward=False, is_teacher=False, tp=4):
+    pytest.importorskip("vllm")
+    from verl.workers.config import RolloutConfig
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+
+    cfg = RolloutConfig(
+        name="vllm",
+        tensor_model_parallel_size=tp,
+        cache_pool=cache_pool or {"enabled": True, "python_hash_seed": 7},
+        engine_kwargs=engine_kwargs or {},
+    )
+    replica = vLLMReplica.__new__(vLLMReplica)
+    replica.config = cfg
+    replica.is_reward_model = is_reward
+    replica.is_teacher_model = is_teacher
+    return replica
+
+
+def _prepare_non_pd_kv_transfer(replica, *, is_npu=False, device="cuda"):
+    runtime = MagicMock()
+    runtime.get_job_id.return_value = "job-1"
+    with (
+        patch(
+            "verl.workers.rollout.vllm_rollout.vllm_async_server.is_torch_npu_available",
+            return_value=is_npu,
+        ),
+        patch(
+            "verl.workers.rollout.vllm_rollout.vllm_async_server.get_device_name",
+            return_value=device,
+        ),
+        patch(
+            "verl.workers.rollout.vllm_rollout.vllm_async_server.ray.get_runtime_context",
+            return_value=runtime,
+        ),
+    ):
+        return replica._prepare_non_pd_kv_transfer()
+
+
+def test_prepare_non_pd_kv_transfer_gpu_injects_store_and_env():
+    replica = _make_unified_replica()
+    kv_cfg, env_vars = _prepare_non_pd_kv_transfer(replica)
+    assert kv_cfg["kv_connector"] == "MooncakeStoreConnector"
+    assert kv_cfg["kv_role"] == "kv_both"
+    assert kv_cfg["kv_buffer_device"] == "cuda"
+    assert kv_cfg["kv_connector_extra_config"]["store_tp_size"] == 4
+    assert kv_cfg["kv_connector_extra_config"]["lookup_rpc_port"] == kv_cfg["engine_id"]
+    assert env_vars["PYTHONHASHSEED"] == "7"
+    assert env_vars["MOONCAKE_CONFIG_PATH"] == mooncake_json_path("job-1")
+    assert env_vars["VERL_RAY_JOB_ID"] == "job-1"
+    assert "MOONCAKE_MASTER" not in env_vars
+
+
+def test_prepare_non_pd_kv_transfer_npu_uses_ascend_store():
+    replica = _make_unified_replica()
+    kv_cfg, _ = _prepare_non_pd_kv_transfer(replica, is_npu=True, device="npu")
+    assert kv_cfg["kv_connector"] == "AscendStoreConnector"
+    assert kv_cfg["kv_role"] == "kv_both"
+    assert kv_cfg["kv_buffer_device"] == "npu"
+    assert "store_tp_size" not in kv_cfg["kv_connector_extra_config"]
+    assert "use_layerwise" not in kv_cfg["kv_connector_extra_config"]
+
+
+@pytest.mark.parametrize("kwargs", [{"is_reward": True}, {"is_teacher": True}])
+def test_prepare_non_pd_kv_transfer_rejects_reward_and_teacher(kwargs):
+    replica = _make_unified_replica(**kwargs)
+    with pytest.raises(ValueError, match="reward or teacher"):
+        _prepare_non_pd_kv_transfer(replica)
+
+
+def test_prepare_non_pd_kv_transfer_disabled_pool_skips():
+    replica = _make_unified_replica(cache_pool={"enabled": False})
+    assert _prepare_non_pd_kv_transfer(replica) == (None, {})
+
+
+def test_prepare_non_pd_kv_transfer_rejects_engine_kwargs_kv_transfer_config():
+    replica = _make_unified_replica(
+        engine_kwargs={"vllm": {"kv_transfer_config": {"kv_connector": "MooncakeStoreConnector"}}}
+    )
+    with pytest.raises(ValueError, match="kv_transfer_config"):
+        _prepare_non_pd_kv_transfer(replica)
 
 
 def test_spawn_disabled_pool_skips_pool_env_and_keeps_kv_cfg():

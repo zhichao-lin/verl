@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure helpers for Mooncake JSON, Store TP, MultiConnector assembly, and master actor."""
+"""Pure helpers for Mooncake JSON, Store TP, connector assembly, and master actor."""
 
 import atexit
 import functools
@@ -166,7 +166,7 @@ def build_mooncake_json(*, store: KVCachePoolStoreConfig, master_address: str, i
     }
 
 
-def build_p2p_connector_config(
+def build_pd_p2p_connector_config(
     *,
     role: str,
     transfer_backend: str,
@@ -202,7 +202,7 @@ def build_p2p_connector_config(
     return cfg
 
 
-def build_store_connector_config(
+def build_pd_store_connector_config(
     *,
     role: str,
     is_npu: bool,
@@ -263,7 +263,7 @@ def build_store_connector_config(
     }
 
 
-def build_kv_transfer_config(
+def build_pd_kv_transfer_config(
     *,
     role: str,
     engine_id: str,
@@ -278,7 +278,7 @@ def build_kv_transfer_config(
     prefill_tps: list[int] | None = None,
 ) -> dict:
     """Assemble a single P2P connector or a MultiConnector with a Store child."""
-    p2p = build_p2p_connector_config(
+    p2p = build_pd_p2p_connector_config(
         role=role,
         transfer_backend=transfer_backend,
         mooncake_protocol=mooncake_protocol,
@@ -293,7 +293,7 @@ def build_kv_transfer_config(
     resolved_prefill_tp = prefill_tp
     resolved_decode_tp = resolve_decode_tp(prefill_tp, decode_tp) if prefill_tp is not None else decode_tp
     resolved_prefill_tps = list(prefill_tps) if prefill_tps is not None else [prefill_tp]
-    store = build_store_connector_config(
+    store = build_pd_store_connector_config(
         role=role,
         is_npu=use_ascend_mooncake_v1,
         cache_pool=cache_pool,
@@ -308,6 +308,58 @@ def build_kv_transfer_config(
         "kv_connector": "MultiConnector",
         "kv_role": _ROLE_TO_KV_ROLE[role],
         "kv_connector_extra_config": {"connectors": [p2p, store]},
+    }
+    if cache_pool.kv_load_failure_policy is not None:
+        cfg["kv_load_failure_policy"] = cache_pool.kv_load_failure_policy
+    return cfg
+
+
+def build_non_pd_kv_transfer_config(
+    *,
+    is_npu: bool,
+    cache_pool: KVCachePoolConfig,
+    engine_id: str,
+    tp: int,
+    kv_buffer_device: str,
+) -> dict:
+    """Build a flat Store connector for non-PD rollout. Both platforms use kv_both.
+
+    GPU writes ``store_tp_size`` (default: this replica's TP). NPU omits Store TP
+    and does not write ``use_layerwise``; that field is memcache prefill-only.
+    """
+    if not isinstance(engine_id, str) or not engine_id:
+        raise ValueError(f"engine_id is required to set lookup_rpc_port, got {engine_id!r}")
+    if tp < 1:
+        raise ValueError(f"tp must be >= 1, got {tp}")
+
+    connector = cache_pool.connector
+    extra: dict = {}
+    if connector.load_async is not None:
+        extra["load_async"] = connector.load_async
+
+    if is_npu:
+        kv_connector = "AscendStoreConnector"
+    else:
+        store_tp = connector.store_tp_size if connector.store_tp_size is not None else tp
+        if store_tp < tp or store_tp % tp != 0:
+            raise ValueError(
+                f"store_tp_size={store_tp} must be >= and divisible by tensor_model_parallel_size={tp}"
+            )
+        extra["store_tp_size"] = store_tp
+        if connector.lookup_async:
+            extra["lookup_async"] = True
+        if connector.cache_prefix:
+            extra["cache_prefix"] = connector.cache_prefix
+        kv_connector = "MooncakeStoreConnector"
+
+    extra.update(cache_pool.extra_config)
+    extra["lookup_rpc_port"] = engine_id
+    cfg = {
+        "kv_connector": kv_connector,
+        "kv_role": "kv_both",
+        "engine_id": engine_id,
+        "kv_buffer_device": kv_buffer_device,
+        "kv_connector_extra_config": extra,
     }
     if cache_pool.kv_load_failure_policy is not None:
         cfg["kv_load_failure_policy"] = cache_pool.kv_load_failure_policy

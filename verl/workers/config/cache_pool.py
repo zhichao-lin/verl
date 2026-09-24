@@ -89,7 +89,7 @@ class KVCachePoolConnectorConfig(BaseConfig):
 
 @dataclass
 class KVCachePoolConfig(BaseConfig):
-    """Platform-agnostic KV cache pool knobs for vLLM PD MultiConnector."""
+    """KV cache pool knobs for vLLM PD MultiConnector and non-PD Store."""
 
     enabled: bool = False
     backend: str = "mooncake"
@@ -108,6 +108,10 @@ class KVCachePoolConfig(BaseConfig):
             return
         if self.backend not in _ALLOWED_BACKENDS:
             raise ValueError(f"cache_pool.backend={self.backend!r} not in {_ALLOWED_BACKENDS}")
+        if self.connector.use_layerwise and self.backend != "memcache":
+            raise ValueError(
+                "cache_pool.connector.use_layerwise is only supported by the NPU memcache backend on a prefill node"
+            )
         if self.backend != "mooncake":
             raise NotImplementedError(
                 f"cache_pool.backend={self.backend!r} is not implemented; only 'mooncake' is supported"
@@ -125,8 +129,6 @@ class KVCachePoolConfig(BaseConfig):
                 "cache_pool.master.enable_multi_tenants=True requires tenant_quota_connector_type "
                 "and tenant_quota_connector_uri"
             )
-        if self.connector.use_layerwise and self.backend == "mooncake":
-            raise ValueError("cache_pool.connector.use_layerwise is incompatible with backend=mooncake")
         if (
             self.kv_load_failure_policy is not None
             and self.kv_load_failure_policy not in _ALLOWED_KV_LOAD_FAILURE_POLICIES

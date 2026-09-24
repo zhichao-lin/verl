@@ -40,7 +40,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
+from verl.utils.device import get_device_name, get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
@@ -54,7 +54,13 @@ from verl.workers.rollout.utils import (
     qwen2_5_vl_dedup_image_tokens,
     run_uvicorn,
 )
-from verl.workers.rollout.vllm_rollout.kv_cache_pool import materialize_mooncake_config, p2p_connector_name
+from verl.workers.rollout.vllm_rollout.kv_cache_pool import (
+    build_non_pd_kv_transfer_config,
+    materialize_mooncake_config,
+    mooncake_json_path,
+    p2p_connector_name,
+    validate_platform_cache_pool,
+)
 from verl.workers.rollout.vllm_rollout.pd_routing import DecodePeerSelector
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -98,6 +104,7 @@ class vLLMHttpServer:
         disaggregation_role: str = "null",
         disaggregation_kv_transfer_config: Optional[dict] = None,
         disaggregation_index: int = -1,
+        non_pd_kv_transfer_config: Optional[dict] = None,
     ):
         """
         Args:
@@ -112,6 +119,8 @@ class vLLMHttpServer:
             disaggregation_role: PD role, or ``"null"`` for normal rollout.
             disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
             disaggregation_index: Index within the prefill or decode pool.
+            non_pd_kv_transfer_config: Flat Store KVTransferConfig for non-PD cache_pool.
+                Ignored when ``disaggregation_role`` is prefill or decode.
         """
         if disaggregation_role not in ("null", "prefill", "decode"):
             raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
@@ -121,6 +130,7 @@ class vLLMHttpServer:
             )
         self._disaggregation_role = disaggregation_role
         self._disaggregation_kv_transfer_config = disaggregation_kv_transfer_config
+        self._non_pd_kv_transfer_config = non_pd_kv_transfer_config
         # Filled by vLLMPDReplica.set_pd_peer for prefill-side routing.
         self._pd_decode_peers: list[ActorHandle] = []
         self._pd_prefill_side_channel_port: Optional[int] = None
@@ -424,6 +434,8 @@ class vLLMHttpServer:
 
         if self._disaggregation_role != "null":
             args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
+        elif self._non_pd_kv_transfer_config:
+            args["kv_transfer_config"] = json.dumps(self._non_pd_kv_transfer_config)
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
@@ -1150,11 +1162,46 @@ class vLLMReplica(RolloutReplica):
         )
         self.server_class = ray.remote(vLLMHttpServer)
 
+    def _prepare_non_pd_kv_transfer(self) -> tuple[dict | None, dict]:
+        """Return ``(kv_transfer_config, env_vars)`` for a non-PD Store connector.
+
+        Reward and teacher replicas must not join the actor prefix pool. Enabling
+        ``cache_pool`` on those replicas raises instead of attaching a connector.
+        """
+        pool = getattr(self.config, "cache_pool", None)
+        if pool is None or not pool.enabled:
+            return None, {}
+        if self.is_reward_model or self.is_teacher_model:
+            raise ValueError("cache_pool.enabled=True is not supported on reward or teacher replicas")
+
+        vllm_kwargs = (getattr(self.config, "engine_kwargs", None) or {}).get("vllm") or {}
+        if vllm_kwargs.get("kv_transfer_config"):
+            raise ValueError("engine_kwargs.vllm.kv_transfer_config conflicts with cache_pool.enabled=True")
+
+        is_npu = is_torch_npu_available(check_device=False)
+        validate_platform_cache_pool(cache_pool=pool, is_npu=is_npu)
+        engine_id = uuid.uuid4().hex
+        kv_cfg = build_non_pd_kv_transfer_config(
+            is_npu=is_npu,
+            cache_pool=pool,
+            engine_id=engine_id,
+            tp=self.config.tensor_model_parallel_size,
+            kv_buffer_device=get_device_name(),
+        )
+        job_id = ray.get_runtime_context().get_job_id()
+        env_vars = {
+            "PYTHONHASHSEED": str(pool.python_hash_seed),
+            "MOONCAKE_CONFIG_PATH": pool.store.config_path or mooncake_json_path(job_id),
+            "VERL_RAY_JOB_ID": job_id,
+        }
+        return kv_cfg, env_vars
+
     async def launch_servers(self):
         """Launch http server in each node."""
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
+        non_pd_kv_cfg, pool_env = self._prepare_non_pd_kv_transfer()
 
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
@@ -1189,6 +1236,7 @@ class vLLMReplica(RolloutReplica):
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
+                **pool_env,
             }
 
             server = self.server_class.options(
@@ -1209,6 +1257,7 @@ class vLLMReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
+                non_pd_kv_transfer_config=non_pd_kv_cfg,
             )
             self.servers.append(server)
 

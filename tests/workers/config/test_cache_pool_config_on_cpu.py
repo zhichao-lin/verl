@@ -92,9 +92,10 @@ def test_multi_tenants_requires_quota_fields():
         KVCachePoolConfig(enabled=True, master={"enable_multi_tenants": True})
 
 
-def test_use_layerwise_rejected_with_mooncake():
+@pytest.mark.parametrize("backend", ["mooncake", "yuanrong"])
+def test_use_layerwise_rejected_unless_memcache(backend):
     with pytest.raises(ValueError, match="use_layerwise"):
-        KVCachePoolConfig(enabled=True, connector={"use_layerwise": True})
+        KVCachePoolConfig(enabled=True, backend=backend, connector={"use_layerwise": True})
 
 
 @pytest.mark.parametrize("policy", ["recompute", "fail"])
@@ -133,9 +134,36 @@ def test_rollout_cache_pool_default_disabled():
     assert cfg.cache_pool.enabled is False
 
 
-def test_rollout_cache_pool_requires_vllm_pd():
-    with pytest.raises(ValueError, match="disaggregation"):
-        RolloutConfig(name="vllm", cache_pool={"enabled": True})
+def test_rollout_cache_pool_non_pd_ok():
+    cfg = RolloutConfig(name="vllm", cache_pool={"enabled": True})
+    assert cfg.cache_pool.enabled is True
+    assert cfg.disaggregation.enabled is False
+
+
+@pytest.mark.parametrize(
+    ("connector", "match"),
+    [
+        ({"enable_store_tp_lcm": True}, "enable_store_tp_lcm"),
+        ({"prefill_tp_sizes": [4, 2]}, "prefill_tp_sizes"),
+        ({"save_decode_cache": True}, "save_decode_cache"),
+        ({"consumer_is_to_put": True}, "consumer_is_to_put"),
+        ({"consumer_is_to_load": True}, "consumer_is_to_load"),
+        ({"prefill_pp_size": 2}, "prefill_pp_size"),
+        ({"prefill_pp_layer_partition": "16,16"}, "prefill_pp_layer_partition"),
+    ],
+)
+def test_rollout_cache_pool_non_pd_rejects_pd_only_fields(connector, match):
+    with pytest.raises(ValueError, match=match):
+        RolloutConfig(name="vllm", cache_pool={"enabled": True, "connector": connector})
+
+
+def test_rollout_cache_pool_pd_allows_save_decode_cache():
+    cfg = RolloutConfig(
+        name="vllm",
+        disaggregation={"enabled": True, "transfer_backend": "mooncake"},
+        cache_pool={"enabled": True, "connector": {"save_decode_cache": True}},
+    )
+    assert cfg.cache_pool.connector.save_decode_cache is True
 
 
 def test_rollout_cache_pool_allows_nixl_transfer():

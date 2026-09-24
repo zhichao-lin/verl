@@ -1,7 +1,8 @@
-# vLLM PD 分离开启 KV Cache Pool（用户指南）
+# vLLM 开启 KV Cache Pool（用户指南）
 
-适用场景：`rollout.name=vllm` 且 **Prefill / Decode 分离（PD）**。  
-本文只讲怎么开，不讲实现细节。
+适用场景：`rollout.name=vllm`。PD 和非 PD 用同一个 `cache_pool.enabled=true`。  
+PD 会组 `MultiConnector`（第 3、4 节）。非 PD 只挂一个 Store，见第 10 节。  
+本文只讲怎么开，不讲实现细节。实现见 `docs/perf/cache_pool/kv_cache_pool_spec.md`。
 
 上游参考：
 
@@ -12,7 +13,7 @@
 
 ## 1. 它做什么
 
-PD 打开后，verl 会给每个 Prefill / Decode 实例组装：
+PD（`disaggregation.enabled=true`）打开后，verl 会给每个 Prefill / Decode 实例组装：
 
 ```text
 MultiConnector = [P2P 连接器, Store 连接器]
@@ -26,20 +27,22 @@ flowchart LR
 ```
 
 - **P2P**：这次请求里，Prefill 把刚算出的 KV 直接传给 Decode。
-- **Pool**：同一 Ray Job 里所有 P/D 实例共享一块 Mooncake 存储。系统提示、工具历史、`rollout.n` 多样本等公共前缀命中后，不必反复 prefill。
+- **Pool**：同一 Ray Job 里挂上 Pool 的实例共享一块 Mooncake 存储。系统提示、工具历史、`rollout.n` 多样本等公共前缀命中后，不必反复 prefill。非 PD 没有 P2P，同一个实例既写也读，见第 10 节。
 
 | 平台 | P2P | Store |
 |---|---|---|
 | GPU | `MooncakeConnector` | `MooncakeStoreConnector` |
 | NPU | `MooncakeConnectorV1` | `AscendStoreConnector` |
 
-不要同时走非 PD 旁路：不要再设 `engine_kwargs.vllm.kv_transfer_config`。PD replica 会自己生成这份配置，两边一起开会报错。
+不要再设 `engine_kwargs.vllm.kv_transfer_config`。`cache_pool.enabled=true` 时，PD 和非 PD 都会自己生成 `kv_transfer_config`，手写这份配置会直接报错。手写旁路只在 `cache_pool.enabled=false` 时保留，见 `docs/perf/rollout_kv_offload.md`。
 
 ---
 
 ## 2. 公共前置条件
 
-YAML 里至少满足：
+下面这份是 **PD** 的最小 YAML。非 PD 把 `disaggregation.enabled` 保持 `false`，并且不要写 `transfer_backend`，完整示例在第 10 节。两边共用后面的 master、JSON 和环境变量。
+
+YAML 里 PD 至少满足：
 
 ```yaml
 actor_rollout_ref.rollout:
@@ -110,7 +113,7 @@ actor_rollout_ref.rollout:
       device_name: ""             # 指定网卡时填写，例如 mlx5_0
 ```
 
-非对称 TP 时，verl 会把 GPU Store 的 `store_tp_size` 设为 `lcm(prefill_tp, decode_tp)`，一般不用手填。
+PD 非对称 TP 时，verl 会把 GPU Store 的 `store_tp_size` 设为 `lcm(prefill_tp, decode_tp)`，一般不用手填。非 PD 没有两端 TP，默认写成 `tensor_model_parallel_size`。
 
 可选：Decode 也把新生成的 decode KV 写回 Pool：
 
@@ -349,7 +352,7 @@ export ASCEND_GLOBAL_RESOURCE_CONFIG='{"fabric_memory.max_capacity":32}'
 | 项 | 含义 |
 |---|---|
 | `cache_pool.store.global_segment_size` | 每卡贡献给 Pool 的 CPU 段。NPU 必须 1GB 对齐 |
-| `cache_pool.python_hash_seed` | 写入所有 P/D 的 `PYTHONHASHSEED`，默认 `0` |
+| `cache_pool.python_hash_seed` | 写入挂上 Pool 的 vLLM 进程的 `PYTHONHASHSEED`，默认 `0`。Reward / teacher 不能开 Pool |
 | `cache_pool.master.auto_start=false` | 复用外部 master，同时给 `master.address` 或 `store.config_path` |
 | `cache_pool.store.tenant_id` | 多租户命名空间；非 `default` 需要 Mooncake ≥ 0.3.12 |
 | `cache_pool.kv_load_failure_policy` | `recompute` / `fail`；空则沿用 vLLM 默认 `fail` |
@@ -370,7 +373,7 @@ cache_pool:
 
 ## 7. 权重更新
 
-每轮策略更新后，verl 会在每台 P/D `vLLMHttpServer` 上调用 `reset_prefix_cache(reset_connector=True)`，清掉本地 prefix cache 和 Store 连接器里的旧 KV。不需要自己去 flush `mooncake_master`。
+每轮策略更新后，verl 会在每台挂了 Pool 的 `vLLMHttpServer` 上调用 `reset_prefix_cache(reset_connector=True)`，清掉本地 prefix cache 和 Store 连接器里的旧 KV。PD 是每台 P/D，非 PD 是每个 actor rollout replica。不需要自己去 flush `mooncake_master`。
 
 ---
 
@@ -573,4 +576,74 @@ CMD=(
 actor_rollout_ref.rollout.cache_pool.store.ssd_offload_path=/nvme/mooncake_offload
 ```
 
-Prefill 开 PP 时再设上游的 `prefill_pp_size` / `prefill_pp_layer_partition`（当前 PD 仍拒绝 PP>1）。`use_layerwise` 仅 memcache，`backend=mooncake` 时不能为 true。`lookup_rpc_port` 由 verl 写成该实例的 `engine_id`，不要手填。
+Prefill 开 PP 时再设上游的 `prefill_pp_size` / `prefill_pp_layer_partition`（当前 PD 仍拒绝 PP>1）。`use_layerwise` 仅 memcache，`backend` 不是 `memcache` 时不能为 true。`lookup_rpc_port` 由 verl 写成该实例的 `engine_id`，不要手填。
+
+---
+
+## 10. 非 PD 怎么开
+
+P/D 在同一套引擎里时用这一节：`disaggregation.enabled=false`。verl 不组 MultiConnector，也不做 P2P。每个 actor rollout replica 挂一个 Store，`kv_role=kv_both`，自己写前缀、自己读命中。
+
+| 平台 | 连接器 |
+|---|---|
+| GPU | `MooncakeStoreConnector` |
+| NPU | `AscendStoreConnector` |
+
+Reward、teacher 的 rollout 不能设 `cache_pool.enabled=true`，否则启动 replica 时直接 `ValueError`，不会挂连接器，也不会写 Mooncake JSON。
+
+第 2 节的 master、JSON、`PYTHONHASHSEED`，第 3.3 节的 GPU SSD 限制，第 4、5 节的 NPU 环境和 SSD，非 PD 同样适用。不要设 `engine_kwargs.vllm.kv_transfer_config`。`transfer_backend` 可以不写，写了也会被忽略。
+
+### 10.1 GPU
+
+软件和协议与第 3.1 节相同。`store_tp_size` 不用手填，默认等于 `tensor_model_parallel_size`。多个 replica 的 TP 必须一致，否则 Store 里的 KV 布局对不上。
+
+```yaml
+actor_rollout_ref.rollout:
+  name: vllm
+  tensor_model_parallel_size: 4
+  enable_prefix_caching: true
+  disaggregation:
+    enabled: false
+  cache_pool:
+    enabled: true
+    store:
+      global_segment_size: 4GB
+      local_buffer_size: 4GB
+      protocol: rdma    # 可省略
+```
+
+需要跨 replica 隔离缓存时再设 `cache_pool.connector.cache_prefix`。`lookup_async=true` 才会写入连接器。
+
+### 10.2 NPU
+
+软件、机型环境变量与第 4.1 节相同。NPU 不写 `store_tp_size`。SSD 按第 5 节设 `ssd_offload_path`，并自行设 `master.client_ttl`。
+
+```yaml
+actor_rollout_ref.rollout:
+  name: vllm
+  tensor_model_parallel_size: 4
+  enable_prefix_caching: true
+  disaggregation:
+    enabled: false
+  cache_pool:
+    enabled: true
+    store:
+      protocol: ascend          # 可省略，空值会写成 ascend
+      device_name: ""           # 必须保持空字符串
+      global_segment_size: 4GB  # 必须 1GB 对齐
+```
+
+### 10.3 不要设的字段
+
+下面这些是 PD 或 GPU Store TP 的开关。非 PD 不要打开：
+
+| 配置 | 非 PD 上的结果 |
+|---|---|
+| `save_decode_cache=true` | 配置期 `ValueError` |
+| `consumer_is_to_put=true` 或 `consumer_is_to_load=true` | 配置期 `ValueError` |
+| `prefill_pp_size` / `prefill_pp_layer_partition` 非空 | 配置期 `ValueError` |
+| `enable_store_tp_lcm=true` 或非空 `prefill_tp_sizes` | 配置期 `ValueError` |
+| NPU 上 `enable_store_tp_lcm`、`prefill_tp_sizes` 不是默认 `null`（含 `false` 和 `[]`） | 启动期 `not supported on this platform` |
+| `use_layerwise=true` 且 `backend` 不是 `memcache` | 配置期 `ValueError`。`memcache` 当前未实现 |
+
+这两个字段的 YAML 默认就是 `null`。不改它们即可。GPU 上显式写成 `false` 或 `[]` 会被忽略；NPU 上只要写了就失败。
