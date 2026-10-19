@@ -566,6 +566,7 @@ def _fake_popen(*, poll=None, output=""):
 def test_master_cmd_minimal():
     cmd = build_mooncake_master_cmd(master=KVCachePoolMasterConfig(), port=50051, enable_offload=False)
     assert cmd[:3] == ["mooncake_master", "--port", "50051"]
+    assert "--enable_metric_reporting" not in cmd
     assert "--enable_offload=true" not in cmd
     assert "--eviction_high_watermark_ratio" not in cmd
     assert "--eviction_ratio" not in cmd
@@ -677,7 +678,7 @@ def test_process_start_does_not_probe():
     proc.stop()
 
 
-def test_process_start_starts_stdout_drain_thread():
+def test_process_start_starts_stdout_forward_thread():
     proc = MooncakeMasterProcess()
     fake = _fake_popen()
     with patch("subprocess.Popen", return_value=fake):
@@ -685,6 +686,76 @@ def test_process_start_starts_stdout_drain_thread():
     assert proc._reader is not None
     assert proc._reader.daemon
     proc.stop()
+
+
+def test_process_forwards_master_output_to_stdout(capsys):
+    proc = MooncakeMasterProcess()
+    line = (
+        "I1019 11:00:00.000000 1 rpc_service.cpp:41] Master Metrics: "
+        "Mem Storage: 14.07 GB / 16.00 GB (87.9%) | Keys: 10\n"
+        "unrelated startup line\n"
+    )
+    fake = _fake_popen(output=line)
+    with patch("subprocess.Popen", return_value=fake):
+        proc.start(["mooncake_master", "--port", "1"], log_output=True)
+        assert proc._reader is not None
+        proc._reader.join(timeout=2)
+    captured = capsys.readouterr()
+    assert (
+        "I1019 11:00:00.000000 1 rpc_service.cpp:41] Master Metrics: "
+        "Mem Storage: 14.07 GB / 16.00 GB (87.9%) | Keys: 10"
+    ) in captured.out
+    assert "unrelated startup line" in captured.out
+    proc.stop()
+
+
+def test_process_forwards_output_split_across_reads(capsys):
+    proc = MooncakeMasterProcess()
+    fake = MagicMock()
+    fake.poll.return_value = None
+    fake.stdout = MagicMock()
+    fake.stdout.read.side_effect = [
+        "noise\nI1019 rpc_service.cpp:41] Master Metrics: Mem Storage: 1 GB / ",
+        "16 GB (6.2%) | Keys: 1\n",
+        "",
+    ]
+    with patch("subprocess.Popen", return_value=fake):
+        proc.start(["mooncake_master", "--port", "1"], log_output=True)
+        assert proc._reader is not None
+        proc._reader.join(timeout=2)
+    captured = capsys.readouterr()
+    assert "noise" in captured.out
+    assert "I1019 rpc_service.cpp:41] Master Metrics: Mem Storage: 1 GB / 16 GB (6.2%) | Keys: 1" in captured.out
+    proc.stop()
+
+
+def test_process_keeps_master_output_for_errors_by_default(capsys):
+    proc = MooncakeMasterProcess()
+    line = "startup failed: address already in use\n"
+    fake = _fake_popen(output=line)
+    with patch("subprocess.Popen", return_value=fake):
+        proc.start(["mooncake_master", "--port", "1"])
+        assert proc._reader is not None
+        proc._reader.join(timeout=2)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    proc.stop()
+    assert "address already in use" in proc._output
+
+
+def test_actor_start_omits_metric_reporting_flag():
+    actor, _ = _make_actor()
+    fake = _fake_popen()
+    with (
+        patch("ray.util.get_node_ip_address", return_value="127.0.0.1"),
+        patch("subprocess.Popen", return_value=fake) as popen,
+        patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.probe_tcp"),
+    ):
+        actor.start({"port": 50051, "log_master_output": True}, enable_offload=False)
+    cmd = popen.call_args.args[0]
+    assert "--enable_metric_reporting" not in cmd
+    assert actor._proc._log_output is True
+    actor.stop()
 
 
 def test_actor_start_treats_port_zero_as_ephemeral():

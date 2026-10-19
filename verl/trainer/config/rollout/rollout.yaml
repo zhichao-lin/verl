@@ -561,6 +561,9 @@ cache_pool:
     # mooncake_master --client_ttl. null = omit.
     client_ttl: null
 
+    # When true, the master actor prints all mooncake_master stdout/stderr.
+    log_master_output: False
+
     # mooncake_master --enable_multi_tenants. Requires quota type and uri.
     enable_multi_tenants: False
 

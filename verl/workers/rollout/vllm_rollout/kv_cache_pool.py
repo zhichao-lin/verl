@@ -515,10 +515,12 @@ class MooncakeMasterProcess:
         self._output = ""
         self._chunks: list[str] = []
         self._reader: threading.Thread | None = None
+        self._log_output = False
 
-    def start(self, cmd: list[str]) -> None:
+    def start(self, cmd: list[str], *, log_output: bool = False) -> None:
         self._chunks = []
         self._output = ""
+        self._log_output = log_output
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -530,14 +532,15 @@ class MooncakeMasterProcess:
             self._reader = None
             return
         self._reader = threading.Thread(
-            target=self._drain_stdout,
+            target=self._forward_stdout,
             args=(stdout,),
             name="mooncake-master-stdout",
             daemon=True,
         )
         self._reader.start()
 
-    def _drain_stdout(self, stdout) -> None:
+    def _forward_stdout(self, stdout) -> None:
+        pending = ""
         try:
             while True:
                 chunk = stdout.read(4096)
@@ -548,8 +551,18 @@ class MooncakeMasterProcess:
                 elif not isinstance(chunk, str):
                     break
                 self._chunks.append(chunk)
+                if self._log_output:
+                    pending = self._forward_lines(pending + chunk)
+            if self._log_output and pending:
+                print(pending, flush=True)
         except Exception:
             pass
+
+    def _forward_lines(self, text: str) -> str:
+        while "\n" in text:
+            line, text = text.split("\n", 1)
+            print(line, flush=True)
+        return text
 
     def stop(self) -> None:
         proc = self._proc
@@ -590,7 +603,7 @@ class MooncakeMasterActor:
 
         cmd = build_mooncake_master_cmd(master=master, port=port, enable_offload=enable_offload)
         try:
-            self._proc.start(cmd)
+            self._proc.start(cmd, log_output=master.log_master_output)
         except FileNotFoundError as e:
             self.stop()
             pkg = (

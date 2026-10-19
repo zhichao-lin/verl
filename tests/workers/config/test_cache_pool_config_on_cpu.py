@@ -27,6 +27,7 @@ def test_defaults_disabled_skip_validation():
     assert cfg.backend == "mooncake"
     assert cfg.python_hash_seed == 0
     assert cfg.master.auto_start is True
+    assert cfg.master.log_master_output is False
     assert cfg.store.mode == "embedded"
     assert cfg.store.global_segment_size == "4GB"
 

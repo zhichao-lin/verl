@@ -46,6 +46,7 @@ class KVCachePoolMasterConfig(BaseConfig):
     eviction_ratio: Optional[float] = None
     default_kv_lease_ttl: Optional[int] = None
     client_ttl: Optional[int] = None
+    log_master_output: bool = False
     enable_multi_tenants: bool = False
     tenant_quota_connector_type: Optional[str] = None
     tenant_quota_connector_uri: Optional[str] = None

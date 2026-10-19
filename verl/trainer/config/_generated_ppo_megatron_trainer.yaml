@@ -467,6 +467,7 @@ actor_rollout_ref:
         eviction_ratio: null
         default_kv_lease_ttl: null
         client_ttl: null
+        log_master_output: false
         enable_multi_tenants: false
         tenant_quota_connector_type: null
         tenant_quota_connector_uri: null
