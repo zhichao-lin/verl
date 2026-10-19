@@ -761,44 +761,60 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
-        # 1. resume rollout memory (weights were released during sleep)
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+        error = None
+        try:
+            # 1. resume rollout memory (weights were released during sleep)
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resume weights", logger=logger)
 
-        # 2. determine if we need a base weight sync (adapter path only)
-        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
-        )
-
-        do_lora_base_sync = False
-        if not self.peft_merge and peft_config is not None:
-            self.rollout.sleep_level = 1
-            do_lora_base_sync = not self.base_sync_done
-
-        # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
-        if do_lora_base_sync:
-            per_tensor_param_base, _base_peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=False
+            # 2. determine if we need a base weight sync (adapter path only)
+            per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+                layered_summon=self.layered_summon, base_sync_done=True
             )
+
+            do_lora_base_sync = False
+            if not self.peft_merge and peft_config is not None:
+                self.rollout.sleep_level = 1
+                do_lora_base_sync = not self.base_sync_done
+
+            # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
+            if do_lora_base_sync:
+                per_tensor_param_base, _base_peft_config = self.actor.engine.get_per_tensor_param(
+                    layered_summon=self.layered_summon, base_sync_done=False
+                )
+                await self.rollout.update_weights(
+                    per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps
+                )
+
             await self.rollout.update_weights(
-                per_tensor_param_base, peft_config=_base_peft_config, base_sync_done=False, global_steps=global_steps
+                per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
             )
 
-        await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
-        )
+            log_gpu_memory_usage("After update_weights", logger=logger)
 
-        log_gpu_memory_usage("After update_weights", logger=logger)
+            # 3. offload model to cpu
+            if self.actor.engine.is_param_offload_enabled:
+                self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
+        except Exception as exc:
+            error = exc
 
-        # 3. offload model to cpu
-        if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
-
-        # 4. resume kv_cache
+        # 4. resume kv_cache only after every rank finishes clear_kv_cache.
         if self.config.rollout.free_cache_engine:
+            failed = torch.tensor(
+                [0 if error is None else 1],
+                dtype=torch.int32,
+                device=get_device_name(),
+            )
+            torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+            if int(failed.item()) != 0:
+                if error is not None:
+                    raise error
+                raise RuntimeError("another rank failed before kv resume")
             await self.rollout.resume(tags=["kv_cache"])
+        elif error is not None:
+            raise error
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
