@@ -36,6 +36,8 @@ from verl.workers.config.cache_pool import (
     KVCachePoolStoreConfig,
 )
 
+_FREE_PORT_ATTEMPTS = 3
+_ADDR_IN_USE_MARKS = ("address already in use", "eaddrinuse")
 _ROLE_TO_KV_ROLE = {
     "prefill": "kv_producer",
     "decode": "kv_consumer",
@@ -453,12 +455,20 @@ def _reject_non_default(obj, defaults: dict) -> None:
             raise ValueError(f"{name} is not supported on this platform")
 
 
-def build_mooncake_master_cmd(*, master: KVCachePoolMasterConfig, port: int, enable_offload: bool) -> list[str]:
+def build_mooncake_master_cmd(
+    *,
+    master: KVCachePoolMasterConfig,
+    port: int,
+    rpc_address: str,
+    enable_offload: bool,
+) -> list[str]:
     """Build the mooncake_master argv from master config and runtime flags."""
     cmd = [
         "mooncake_master",
-        "--port",
+        "--rpc_port",
         str(port),
+        "--rpc_address",
+        rpc_address,
     ]
     if master.eviction_high_watermark_ratio is not None:
         cmd.extend(["--eviction_high_watermark_ratio", str(master.eviction_high_watermark_ratio)])
@@ -518,10 +528,15 @@ class MooncakeMasterProcess:
         self._reader: threading.Thread | None = None
         self._log_output = False
 
-    def start(self, cmd: list[str], *, log_output: bool = False) -> None:
+    def start(self, cmd: list[str], *, log_output: bool = False, reserve_sock=None) -> None:
         self._chunks = []
         self._output = ""
         self._log_output = log_output
+        if reserve_sock is not None:
+            try:
+                reserve_sock.close()
+            except OSError:
+                pass
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -552,18 +567,16 @@ class MooncakeMasterProcess:
                 elif not isinstance(chunk, str):
                     break
                 self._chunks.append(chunk)
-                if self._log_output:
-                    pending = self._forward_lines(pending + chunk)
+                if not self._log_output:
+                    continue
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    print(line, flush=True)
             if self._log_output and pending:
                 print(pending, flush=True)
         except Exception:
             pass
-
-    def _forward_lines(self, text: str) -> str:
-        while "\n" in text:
-            line, text = text.split("\n", 1)
-            print(line, flush=True)
-        return text
 
     def stop(self) -> None:
         proc = self._proc
@@ -597,34 +610,41 @@ class MooncakeMasterActor:
             else KVCachePoolMasterConfig(**dict(master_cfg))
         )
         ip = ray.util.get_node_ip_address().strip("[]")
-        if master.port in (None, 0):
-            port, _ = get_free_port(ip)
-        else:
+        pick_port = master.port in (None, 0)
+        last_error: Exception | None = None
+        for _ in range(_FREE_PORT_ATTEMPTS if pick_port else 1):
+            reserve_sock = None
             port = master.port
-
-        cmd = build_mooncake_master_cmd(master=master, port=port, enable_offload=enable_offload)
-        try:
-            self._proc.start(cmd, log_output=master.log_master_output)
-        except FileNotFoundError as e:
-            self.stop()
-            pkg = (
-                "mooncake-transfer-engine-npu"
-                if is_torch_npu_available(check_device=False)
-                else "mooncake-transfer-engine"
+            if pick_port:
+                port, reserve_sock = get_free_port(ip, with_alive_sock=True)
+            cmd = build_mooncake_master_cmd(
+                master=master, port=port, rpc_address=ip, enable_offload=enable_offload
             )
-            raise RuntimeError(f"mooncake_master not found; install {pkg}") from e
+            try:
+                self._proc.start(cmd, log_output=master.log_master_output, reserve_sock=reserve_sock)
+            except FileNotFoundError as e:
+                self.stop()
+                pkg = (
+                    "mooncake-transfer-engine-npu"
+                    if is_torch_npu_available(check_device=False)
+                    else "mooncake-transfer-engine"
+                )
+                raise RuntimeError(f"mooncake_master not found; install {pkg}") from e
 
-        address = format_host_port(ip, port)
-        try:
-            self._wait_until_listening(ip, port)
-        except Exception as e:
-            output = self._stop_and_capture_output()
-            raise RuntimeError(
-                f"mooncake_master failed to listen on {address}; cmd={cmd!r}; output={output}"
-            ) from e
-
-        self._address = address
-        return self._address
+            address = format_host_port(ip, port)
+            try:
+                self._wait_until_listening(ip, port)
+            except Exception as e:
+                output = self._stop_and_capture_output()
+                last_error = RuntimeError(
+                    f"mooncake_master failed to listen on {address}; cmd={cmd!r}; output={output}"
+                )
+                if not pick_port or not any(mark in str(last_error).lower() for mark in _ADDR_IN_USE_MARKS):
+                    raise last_error from e
+                continue
+            self._address = address
+            return self._address
+        raise last_error
 
     def _child_is_alive(self) -> bool:
         popen = getattr(self._proc, "_proc", None)

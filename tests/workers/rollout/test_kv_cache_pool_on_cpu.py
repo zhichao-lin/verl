@@ -590,8 +590,10 @@ def _fake_popen(*, poll=None, output=""):
 
 
 def test_master_cmd_minimal():
-    cmd = build_mooncake_master_cmd(master=KVCachePoolMasterConfig(), port=50051, enable_offload=False)
-    assert cmd[:3] == ["mooncake_master", "--port", "50051"]
+    cmd = build_mooncake_master_cmd(
+        master=KVCachePoolMasterConfig(), port=50051, rpc_address="10.0.0.1", enable_offload=False
+    )
+    assert cmd[:5] == ["mooncake_master", "--rpc_port", "50051", "--rpc_address", "10.0.0.1"]
     assert "--enable_metric_reporting" not in cmd
     assert "--enable_offload=true" not in cmd
     assert "--eviction_high_watermark_ratio" not in cmd
@@ -607,7 +609,7 @@ def test_master_cmd_ssd_and_tenants():
         eviction_high_watermark_ratio=0.8,
         eviction_ratio=0.2,
     )
-    cmd = build_mooncake_master_cmd(master=master, port=50088, enable_offload=True)
+    cmd = build_mooncake_master_cmd(master=master, port=50088, rpc_address="10.0.0.1", enable_offload=True)
     assert "--enable_offload=true" in cmd
     assert "--enable_multi_tenants=true" in cmd
     assert "--client_ttl" in cmd
@@ -682,12 +684,15 @@ def test_dead_child_fails_even_if_probe_would_succeed():
     fake = _fake_popen(poll=1, output="Address already in use")
     with (
         patch("ray.util.get_node_ip_address", return_value="127.0.0.1"),
-        patch("subprocess.Popen", return_value=fake),
+        patch("subprocess.Popen", return_value=fake) as popen,
         patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.probe_tcp") as probe,
+        patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.get_free_port") as get_port,
     ):
         with pytest.raises(RuntimeError, match="mooncake_master") as ei:
             actor.start({"port": 50051}, enable_offload=False)
     probe.assert_not_called()
+    get_port.assert_not_called()
+    popen.assert_called_once()
     message = str(ei.value)
     assert "Address already in use" in message
 
@@ -787,18 +792,69 @@ def test_actor_start_omits_metric_reporting_flag():
 def test_actor_start_treats_port_zero_as_ephemeral():
     actor, _ = _make_actor()
     fake = _fake_popen()
+    reserve = MagicMock()
+    order = []
+    reserve.close.side_effect = lambda: order.append("close")
+
+    def popen(*args, **kwargs):
+        order.append("popen")
+        return fake
+
     with (
         patch("ray.util.get_node_ip_address", return_value="127.0.0.1"),
+        patch("subprocess.Popen", side_effect=popen) as popen_mock,
+        patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.probe_tcp"),
+        patch(
+            "verl.workers.rollout.vllm_rollout.kv_cache_pool.get_free_port",
+            return_value=(54321, reserve),
+        ) as get_port,
+    ):
+        addr = actor.start({"port": 0}, enable_offload=False)
+    get_port.assert_called_once_with("127.0.0.1", with_alive_sock=True)
+    assert order == ["close", "popen"]
+    cmd = popen_mock.call_args.args[0]
+    assert cmd[cmd.index("--rpc_address") + 1] == "127.0.0.1"
+    assert addr == "127.0.0.1:54321"
+    actor.stop()
+
+
+def test_free_port_retries_when_address_in_use():
+    actor, _ = _make_actor()
+    first = _fake_popen(poll=1, output="bind: Address already in use\n")
+    second = _fake_popen()
+    reserves = [MagicMock(), MagicMock()]
+    with (
+        patch("ray.util.get_node_ip_address", return_value="10.0.0.1"),
+        patch("subprocess.Popen", side_effect=[first, second]),
+        patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.probe_tcp"),
+        patch(
+            "verl.workers.rollout.vllm_rollout.kv_cache_pool.get_free_port",
+            side_effect=[(1111, reserves[0]), (2222, reserves[1])],
+        ) as get_port,
+    ):
+        addr = actor.start({"port": None}, enable_offload=False)
+    assert get_port.call_count == 2
+    assert addr == "10.0.0.1:2222"
+    reserves[0].close.assert_called_once()
+    reserves[1].close.assert_called_once()
+    actor.stop()
+
+
+def test_free_port_does_not_retry_other_exit():
+    actor, _ = _make_actor()
+    fake = _fake_popen(poll=1, output="invalid flag\n")
+    with (
+        patch("ray.util.get_node_ip_address", return_value="10.0.0.1"),
         patch("subprocess.Popen", return_value=fake),
         patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.probe_tcp"),
         patch(
             "verl.workers.rollout.vllm_rollout.kv_cache_pool.get_free_port",
-            return_value=(54321, None),
+            return_value=(1111, MagicMock()),
         ) as get_port,
     ):
-        addr = actor.start({"port": 0}, enable_offload=False)
+        with pytest.raises(RuntimeError, match="invalid flag"):
+            actor.start({"port": 0}, enable_offload=False)
     get_port.assert_called_once()
-    assert addr == "127.0.0.1:54321"
     actor.stop()
 
 
@@ -807,10 +863,12 @@ def test_actor_start_formats_ipv6_address():
     fake = _fake_popen()
     with (
         patch("ray.util.get_node_ip_address", return_value="[2001:db8::1]"),
-        patch("subprocess.Popen", return_value=fake),
+        patch("subprocess.Popen", return_value=fake) as popen,
         patch("verl.workers.rollout.vllm_rollout.kv_cache_pool.probe_tcp"),
     ):
         addr = actor.start({"port": 50051}, enable_offload=False)
+    cmd = popen.call_args.args[0]
+    assert cmd[cmd.index("--rpc_address") + 1] == "2001:db8::1"
     assert addr == "[2001:db8::1]:50051"
     assert actor._proc._reader is not None
     actor.stop()
