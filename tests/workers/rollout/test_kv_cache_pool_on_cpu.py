@@ -196,6 +196,11 @@ def test_platform_gpu_rejects_enable_offload():
         validate_platform_cache_pool(cache_pool=cfg, is_npu=False)
 
 
+def test_platform_npu_allows_save_decode_cache():
+    cfg = KVCachePoolConfig(enabled=True, connector={"save_decode_cache": True})
+    validate_platform_cache_pool(cache_pool=cfg, is_npu=True)
+
+
 def test_platform_npu_rejects_unaligned_segment():
     cfg = KVCachePoolConfig(store={"global_segment_size": "512MB"})
     with pytest.raises(ValueError, match="1GB"):
@@ -303,6 +308,27 @@ def test_npu_multiconnector():
     assert store["kv_role"] == "kv_producer"
     assert store["kv_connector_extra_config"] == {"lookup_rpc_port": "e0"}
     assert "store_tp_size" not in store["kv_connector_extra_config"]
+
+
+def test_npu_multiconnector_decode_save_decode_cache():
+    pool = KVCachePoolConfig(enabled=True, connector={"save_decode_cache": True})
+    cfg = build_pd_kv_transfer_config(
+        role="decode",
+        engine_id="e1",
+        kv_buffer_device="npu",
+        transfer_backend="mooncake",
+        mooncake_protocol=None,
+        use_ascend_mooncake_v1=True,
+        kv_port=20001,
+        prefill_tp=4,
+        decode_tp=2,
+        cache_pool=pool,
+        prefill_tps=[4],
+    )
+    store = cfg["kv_connector_extra_config"]["connectors"][1]
+    assert store["kv_connector"] == "AscendStoreConnector"
+    assert store["kv_role"] == "kv_consumer"
+    assert store["kv_connector_extra_config"]["save_decode_cache"] is True
 
 
 def _store_lookup(engine_id):

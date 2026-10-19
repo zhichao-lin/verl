@@ -625,7 +625,7 @@ cache_pool:
     # GPU. Written only when non-empty.
     cache_prefix: ""
 
-    # GPU PD decode. Written only when true. Non-PD rejects true.
+    # PD decode on GPU and NPU. Written only when true. Non-PD rejects true.
     save_decode_cache: False
 
     # GPU. PD null = lcm(prefill_tp, decode_tp). Non-PD null = tensor_model_parallel_size.

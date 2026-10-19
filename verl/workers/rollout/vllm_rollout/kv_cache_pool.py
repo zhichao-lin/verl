@@ -51,7 +51,6 @@ _NPU_STORE_PROTOCOLS = (None, "ascend")
 _GPU_CONNECTOR_DEFAULTS = {
     "lookup_async": False,
     "cache_prefix": "",
-    "save_decode_cache": False,
     "store_tp_size": None,
     "enable_store_tp_lcm": None,
     "prefill_tp_sizes": None,
@@ -232,6 +231,8 @@ def build_pd_store_connector_config(
             extra["prefill_pp_size"] = connector.prefill_pp_size
         if connector.prefill_pp_layer_partition is not None:
             extra["prefill_pp_layer_partition"] = connector.prefill_pp_layer_partition
+        if role == "decode" and connector.save_decode_cache:
+            extra["save_decode_cache"] = True
         kv_connector = "AscendStoreConnector"
         kv_role = _ROLE_TO_KV_ROLE[role]
     else:
